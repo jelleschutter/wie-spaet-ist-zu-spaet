@@ -1,7 +1,7 @@
-import { readFile } from 'node:fs/promises';
 import { StopsIndex, Timetable } from 'minotor';
 import type { Stop } from 'minotor';
-import { AggregateIndex } from './aggregate';
+import { fetchBinary, fetchJson } from './assets';
+import { DelayIndex, type DelaysMeta, type StationDelays } from './delays';
 import { formatDelay, hmToMinutes, minutesToClock, secondsToClock, type DayType } from './time';
 
 // minotor's top-level package export re-exports a `Route`/`ServiceRouteInfo`
@@ -36,19 +36,27 @@ const ROUTE_TYPE_LABELS: Record<number, string> = {
 // ---------------------------------------------------------------------------
 // TransitPlanner
 //
-// Trimmed port of transit-router's src/planner.js: this app only ever asks
-// "what's the next departure from this station, and how late can I be for
-// it?" - a single-stop departure-board lookup - never a RAPTOR A-to-B route,
-// so there's no Router/Query here, just the Timetable's per-stop route index.
+// Runs entirely in the browser against the static data bundle in static/data/:
+// this app only ever asks "what's the next departure from this station, and how
+// late can I be for it?" - a single-stop departure-board lookup - never a
+// RAPTOR A-to-B route, so there's no Router/Query here, just the Timetable's
+// per-stop route index.
+//
+// Everything loads lazily and is then cached for the session: the stops index
+// (~2.3 MB) on the first station search, a day type's timetable (~3-5 MB) on
+// the first lookup for that day, and one ~15 KB delay shard per station.
 // ---------------------------------------------------------------------------
 
-export class HttpError extends Error {
-	status: number;
-	constructor(status: number, message: string) {
-		super(message);
-		this.status = status;
-	}
-}
+/** An error with a message meant to be shown to the user as-is. */
+export class TransitError extends Error {}
+
+export type StaticMeta = {
+	version: number;
+	generatedAt: string;
+	serviceDays: DayType[];
+	delays: DelaysMeta;
+	lines: string[];
+};
 
 export type StopDto = {
 	id: number;
@@ -79,6 +87,17 @@ export type DepartureDto = {
 	departure: DepartureEventDto;
 };
 
+export type DeparturesResult = {
+	query: { from: StopDto; time: string; serviceDayType: DayType };
+	availableServiceDays: DayType[];
+	delaysAvailable: boolean;
+	dayType: DayType | null;
+	days: number | null;
+	availableDayTypes: DayType[];
+	nextDepartureTime: string | null;
+	results: DepartureDto[];
+};
+
 type Candidate = {
 	route: TimetableRoute;
 	boardStopId: number;
@@ -87,137 +106,89 @@ type Candidate = {
 };
 
 export class TransitPlanner {
-	private timetables: Partial<Record<DayType, Timetable>> = {};
-	private stopsIndex!: StopsIndex;
-	private sloidToDidok = new Map<string, string>();
-	private aggregate: AggregateIndex | null = null;
+	private metaPromise?: Promise<StaticMeta>;
+	private stopsPromise?: Promise<StopsIndex>;
+	private timetablePromises = new Map<DayType, Promise<Timetable>>();
+	private delaysPromise?: Promise<DelayIndex>;
+	private stopsLoaded = false;
+	private timetablesLoaded = new Set<DayType>();
 
-	stopsReady = false;
-	delaysReady = false;
-	delaysError: Error | null = null;
-
-	constructor(
-		private paths: {
-			timetablePaths: Partial<Record<DayType, string>>;
-			stopsPath: string;
-			didokPath?: string;
-			aggregatePath?: string;
-		}
-	) {}
-
-	isReady(): boolean {
-		return this.stopsReady;
+	/** Whether a lookup for this day type can be answered without more downloads. */
+	isReady(dayType: DayType): boolean {
+		return this.stopsLoaded && this.timetablesLoaded.has(dayType);
 	}
 
-	/** Loads the timetables and stops index (fast), then the delay index in the background. */
-	async load(log: (msg: string) => void = console.log): Promise<void> {
-		log('Loading timetables and stops index...');
-		this.stopsIndex = StopsIndex.fromData(await readFile(this.paths.stopsPath));
-
-		for (const [dayType, path] of Object.entries(this.paths.timetablePaths) as [DayType, string][]) {
-			this.timetables[dayType] = Timetable.fromData(await readFile(path));
+	/** Metadata of the static bundle: available service days, delay coverage, lines. */
+	meta(): Promise<StaticMeta> {
+		if (!this.metaPromise) {
+			const promise = (this.metaPromise = fetchJson<StaticMeta>('meta.json'));
+			promise.catch(() => {
+				if (this.metaPromise === promise) this.metaPromise = undefined;
+			});
 		}
-		if (this.timetableDayTypes.length === 0) {
-			throw new Error('No timetable files were configured.');
-		}
-
-		await this.loadDidokMap(log);
-
-		this.stopsReady = true;
-		log(
-			`Stops index ready (${this.stopsIndex.size().toLocaleString('en-US')} stops). ` +
-				`Timetables: ${this.timetableDayTypes.join(', ')}.`
-		);
-
-		this.loadDelays(log);
+		return this.metaPromise;
 	}
 
-	private async loadDidokMap(log: (msg: string) => void) {
-		const path = this.paths.didokPath;
-		if (!path) return;
-		let text: string;
-		try {
-			text = await readFile(path, 'utf8');
-		} catch {
-			return;
+	private stops(): Promise<StopsIndex> {
+		if (!this.stopsPromise) {
+			const promise = (this.stopsPromise = fetchBinary('stops.bin.gz').then((data) => {
+				const index = StopsIndex.fromData(data as Uint8Array);
+				this.stopsLoaded = true;
+				return index;
+			}));
+			promise.catch(() => {
+				if (this.stopsPromise === promise) this.stopsPromise = undefined;
+			});
 		}
-		let first = true;
-		for (const line of text.split('\n')) {
-			if (!line) continue;
-			if (first) {
-				first = false; // skip the "sloid,didok" header
-				continue;
-			}
-			const comma = line.indexOf(',');
-			if (comma < 0) continue;
-			const sloid = line.slice(0, comma).trim();
-			const didok = line.slice(comma + 1).trim();
-			if (sloid && didok) this.sloidToDidok.set(sloid, didok);
+		return this.stopsPromise;
+	}
+
+	private timetable(dayType: DayType): Promise<Timetable> {
+		const cached = this.timetablePromises.get(dayType);
+		if (cached) return cached;
+		const promise = fetchBinary(`timetable.${dayType}.bin.gz`).then((data) => {
+			const timetable = Timetable.fromData(data as Uint8Array);
+			this.timetablesLoaded.add(dayType);
+			return timetable;
+		});
+		promise.catch(() => {
+			if (this.timetablePromises.get(dayType) === promise) this.timetablePromises.delete(dayType);
+		});
+		this.timetablePromises.set(dayType, promise);
+		return promise;
+	}
+
+	private delays(): Promise<DelayIndex> {
+		if (!this.delaysPromise) {
+			this.delaysPromise = this.meta().then((meta) => new DelayIndex(meta.delays, meta.lines));
+			this.delaysPromise.catch(() => (this.delaysPromise = undefined));
 		}
-		log(`DIDOK map ready (${this.sloidToDidok.size.toLocaleString('en-US')} stops).`);
+		return this.delaysPromise;
 	}
 
-	private async loadDelays(log: (msg: string) => void) {
-		if (!this.paths.aggregatePath) return;
-		try {
-			const t0 = Date.now();
-			log('Indexing aggregated delays (averages by day type) in the background...');
-			this.aggregate = await AggregateIndex.load(this.paths.aggregatePath, log);
-			const summary = this.aggregate.dayTypes
-				.map((t) => `${t} (${this.aggregate!.daysFor(t)}d)`)
-				.join(', ');
-			this.delaysReady = true;
-			const secs = ((Date.now() - t0) / 1000).toFixed(1);
-			log(
-				`Average delays ready: ${summary}; ` +
-					`${this.aggregate.eventCount.toLocaleString('en-US')} service rows (${secs}s).`
-			);
-		} catch (err) {
-			this.delaysError = err as Error;
-			log(`Failed to index delays: ${(err as Error).message}`);
-		}
-	}
-
-	/** Day types that have a loaded timetable, e.g. ['weekday', 'saturday']. */
-	get timetableDayTypes(): DayType[] {
-		return Object.keys(this.timetables) as DayType[];
-	}
-
-	/** Day types that have aggregated delay data, e.g. ['weekday', 'saturday']. */
-	get dayTypes(): DayType[] {
-		return this.aggregate?.dayTypes ?? [];
-	}
-
-	get delaysMeta() {
-		return {
-			ready: this.delaysReady,
-			dayTypes: this.dayTypes,
-			days: Object.fromEntries(this.dayTypes.map((t) => [t, this.aggregate?.daysFor(t) ?? 0])),
-			error: this.delaysError?.message ?? null
-		};
+	/**
+	 * Starts fetching what the first interaction will need (metadata and the
+	 * stops index), so typing into the station search doesn't wait for it.
+	 */
+	prewarm(): void {
+		void this.meta().catch(() => {});
+		void this.stops().catch(() => {});
 	}
 
 	/** The day type whose timetable is actually used for a requested one. */
-	private resolveTimetableDayType(requested: string | undefined): DayType | null {
-		const want = (requested || 'weekday') as DayType;
-		if (this.timetables[want]) return want;
-		if (this.timetables.weekday) return 'weekday';
-		return this.timetableDayTypes[0] ?? null;
-	}
-
-	/** Resolves a requested day type to one that has aggregate data (default: weekday). */
-	private resolveDayType(requested: string | undefined): DayType | null {
-		const types = this.dayTypes;
-		if (types.length === 0) return null;
-		if (requested && types.includes(requested as DayType)) return requested as DayType;
-		return types.includes('weekday') ? 'weekday' : types[0];
+	private resolveTimetableDayType(
+		serviceDays: DayType[],
+		requested: string | undefined | null
+	): DayType | null {
+		if (requested && serviceDays.includes(requested as DayType)) return requested as DayType;
+		return serviceDays[0] ?? null;
 	}
 
 	// -------------------------------------------------------------------------
 	// Stop search
 	// -------------------------------------------------------------------------
 
-	searchStations({
+	async searchStations({
 		q,
 		lat,
 		lon,
@@ -229,34 +200,35 @@ export class TransitPlanner {
 		lon?: number;
 		radius?: number;
 		limit?: number;
-	}): StopDto[] {
+	}): Promise<StopDto[]> {
+		const stopsIndex = await this.stops();
 		if (lat != null && lon != null) {
 			// Generous default radius (unlike a map-style nearby search) since this
 			// mainly backs a single "nearest station to me" lookup that should
 			// still find something for someone standing a few km from any stop.
-			return this.stopsIndex
+			return stopsIndex
 				.findStopsByLocation(lat, lon, limit, radius ?? 5)
 				.map((s) => this.stopDto(s));
 		}
 		if (!q) return [];
 		// Over-fetch, then re-rank so exact/prefix matches beat substring hits.
-		const pool = this.stopsIndex.findStopsByName(q, Math.max(limit, 25));
+		const pool = stopsIndex.findStopsByName(q, Math.max(limit, 25));
 		return rankByName(pool, q)
 			.slice(0, limit)
 			.map((s) => this.stopDto(s));
 	}
 
 	/** Resolves a `from` argument: an internal numeric stop id, a GTFS source id, or a name. */
-	private resolveStop(arg: string | null | undefined): Stop | undefined {
+	private resolveStop(stopsIndex: StopsIndex, arg: string | null | undefined): Stop | undefined {
 		if (arg == null || arg === '') return undefined;
 		const str = String(arg).trim();
 		if (/^\d+$/.test(str)) {
-			const byId = this.stopsIndex.findStopById(Number(str));
+			const byId = stopsIndex.findStopById(Number(str));
 			if (byId) return byId;
 		}
-		const bySource = this.stopsIndex.findStopBySourceStopId(str);
+		const bySource = stopsIndex.findStopBySourceStopId(str);
 		if (bySource) return bySource;
-		const candidates = this.stopsIndex.findStopsByName(str, 25);
+		const candidates = stopsIndex.findStopsByName(str, 25);
 		return rankByName(candidates, str)[0];
 	}
 
@@ -271,7 +243,7 @@ export class TransitPlanner {
 	 * timetable spreads departures across child stop ids. When several
 	 * services are tied for the earliest departure minute, all are returned.
 	 */
-	getDepartures({
+	async getDepartures({
 		from,
 		time = '08:00',
 		dayType
@@ -279,26 +251,39 @@ export class TransitPlanner {
 		from: string | null;
 		time?: string;
 		dayType?: string | null;
-	}) {
-		if (!from) throw new HttpError(400, 'Bitte gib einen Abfahrtsort ein.');
-		const origin = this.resolveStop(from);
-		if (!origin) throw new HttpError(404, `Station "${from}" wurde nicht gefunden.`);
+	}): Promise<DeparturesResult> {
+		if (!from) throw new TransitError('Bitte gib einen Abfahrtsort ein.');
 
 		let afterMinutes: number;
 		try {
 			afterMinutes = hmToMinutes(time);
 		} catch (e) {
-			throw new HttpError(400, (e as Error).message);
+			throw new TransitError((e as Error).message);
 		}
 
-		const serviceDayType = this.resolveTimetableDayType(dayType ?? undefined);
-		const timetable = serviceDayType ? this.timetables[serviceDayType] : null;
-		if (!timetable) throw new HttpError(503, 'Der Fahrplan wird noch geladen.');
-		const useDayType = this.resolveDayType(dayType ?? undefined);
+		const [meta, stopsIndex] = await Promise.all([this.meta(), this.stops()]);
+		const origin = this.resolveStop(stopsIndex, from);
+		if (!origin) throw new TransitError(`Station "${from}" wurde nicht gefunden.`);
+
+		const serviceDayType = this.resolveTimetableDayType(meta.serviceDays, dayType);
+		if (!serviceDayType) throw new TransitError('Es sind keine Fahrplandaten vorhanden.');
+
+		const delays = await this.delays();
+		const useDayType = delays.resolveDayType(dayType);
+		// Every board stop below is an equivalent stop of `origin`, so they all
+		// share one BPUIC - a lookup never needs more than one delay shard.
+		const station = origin.parent != null ? stopsIndex.findStopById(origin.parent) : undefined;
+		const bpuic = bpuicOf(station ?? origin) ?? bpuicOf(origin);
+		const [timetable, stationDelays] = await Promise.all([
+			this.timetable(serviceDayType),
+			useDayType && bpuic != null
+				? delays.forStation(useDayType, bpuic)
+				: Promise.resolve(null)
+		]);
 
 		const boardStopIds = new Set<number>([
 			origin.id,
-			...this.stopsIndex.equivalentStops(origin.id).map((s) => s.id)
+			...stopsIndex.equivalentStops(origin.id).map((s) => s.id)
 		]);
 
 		const candidates: Candidate[] = [];
@@ -330,21 +315,27 @@ export class TransitPlanner {
 			time: minutesToClock(afterMinutes),
 			serviceDayType
 		};
+		const delayMeta = {
+			delaysAvailable: delays.dayTypes.length > 0,
+			dayType: useDayType,
+			days: useDayType ? delays.daysFor(useDayType) : null,
+			availableDayTypes: delays.dayTypes
+		};
 
 		if (candidates.length === 0) {
 			return {
 				query,
-				availableServiceDays: this.timetableDayTypes,
-				...this.delayMeta(useDayType),
+				availableServiceDays: meta.serviceDays,
+				...delayMeta,
 				nextDepartureTime: null,
-				results: [] as DepartureDto[]
+				results: []
 			};
 		}
 
 		const earliest = Math.min(...candidates.map((c) => c.departureTime));
 		const results = candidates
 			.filter((c) => c.departureTime === earliest)
-			.map((c) => this.departureDto(c, useDayType))
+			.map((c) => this.departureDto(stopsIndex, c, stationDelays))
 			.sort(
 				(a, b) =>
 					a.line.localeCompare(b.line) ||
@@ -353,16 +344,20 @@ export class TransitPlanner {
 
 		return {
 			query,
-			availableServiceDays: this.timetableDayTypes,
-			...this.delayMeta(useDayType),
+			availableServiceDays: meta.serviceDays,
+			...delayMeta,
 			nextDepartureTime: minutesToClock(earliest),
 			results
 		};
 	}
 
-	private departureDto({ route, boardStopId, departureTime, serviceInfo }: Candidate, dayType: DayType | null): DepartureDto {
-		const boardStop = this.stopsIndex.findStopById(boardStopId)!;
-		const destStop = this.stopsIndex.findStopById(route.stops[route.getNbStops() - 1]);
+	private departureDto(
+		stopsIndex: StopsIndex,
+		{ route, boardStopId, departureTime, serviceInfo }: Candidate,
+		stationDelays: StationDelays | null
+	): DepartureDto {
+		const boardStop = stopsIndex.findStopById(boardStopId)!;
+		const destStop = stopsIndex.findStopById(route.stops[route.getNbStops() - 1]);
 
 		const dto: DepartureDto = {
 			line: serviceInfo.name,
@@ -373,15 +368,7 @@ export class TransitPlanner {
 			departure: eventTiming(departureTime, null)
 		};
 
-		if (!this.delaysReady || !this.aggregate || !dayType) return dto;
-
-		const match = this.aggregate.matchDeparture(dayType, {
-			fromIds: this.equivalentSloids(boardStop),
-			fromBpuics: this.bpuicsFor(boardStop),
-			fromName: boardStop.name,
-			line: serviceInfo.name,
-			plannedDepMin: departureTime % (24 * 60)
-		});
+		const match = stationDelays?.match(serviceInfo.name, departureTime % (24 * 60));
 		if (!match) return dto;
 		dto.departure = eventTiming(departureTime, {
 			delaySec: match.avg,
@@ -390,44 +377,6 @@ export class TransitPlanner {
 			dayOffset: match.dayOffset
 		});
 		return dto;
-	}
-
-	/** Top-level delay context for a response (which day type, coverage). */
-	private delayMeta(dayType: DayType | null) {
-		return {
-			delaysAvailable: this.delaysReady,
-			dayType: dayType,
-			days: dayType ? (this.aggregate?.daysFor(dayType) ?? 0) : null,
-			availableDayTypes: this.dayTypes
-		};
-	}
-
-	/**
-	 * All SLOIDs equivalent to a stop: itself, sibling platforms, and the
-	 * platform-less station entry (bare `ch:1:sloid:<number>`), since Ist-Daten
-	 * reports some modes at platform level and others at station level.
-	 */
-	private equivalentSloids(stop: Stop): string[] {
-		const ids = new Set<string>();
-		for (const s of this.stopsIndex.equivalentStops(stop.id)) {
-			const id = s.sourceStopId;
-			if (typeof id !== 'string') continue;
-			ids.add(id);
-			const m = id.match(/^(ch:1:sloid:\d+)(?:[:_].*)?$/);
-			if (m) ids.add(m[1]);
-		}
-		return [...ids];
-	}
-
-	/** The BPUIC(s) of a stop, resolved from the sloid->didok sidecar. */
-	private bpuicsFor(stop: Stop): string[] {
-		if (this.sloidToDidok.size === 0) return [];
-		const out = new Set<string>();
-		for (const sloid of this.equivalentSloids(stop)) {
-			const didok = this.sloidToDidok.get(sloid);
-			if (didok) out.add(didok);
-		}
-		return [...out];
 	}
 
 	private stopDto(stop: Stop): StopDto {
@@ -443,17 +392,42 @@ export class TransitPlanner {
 	}
 }
 
+/**
+ * The BPUIC of a stop. Stop ids in the feed are `<bpuic>[:<platform>]`, and the
+ * delay shards are keyed by that number (see delays.ts), so it is all the
+ * browser needs to find a station's Ist-Daten.
+ */
+function bpuicOf(stop: Stop): number | null {
+	const source = stop.sourceStopId;
+	if (typeof source !== 'string') return null;
+	const head = source.split(':', 1)[0];
+	return /^\d+$/.test(head) ? Number(head) : null;
+}
+
 /** Builds the planned/actual/delay block for one boarding event. */
 function eventTiming(
 	plannedTime: number,
-	info: { delaySec: number | null; catchBufferSec?: number | null; samples?: number | null; dayOffset?: number } | null
+	info: {
+		delaySec: number | null;
+		catchBufferSec?: number | null;
+		samples?: number | null;
+		dayOffset?: number;
+	} | null
 ): DepartureEventDto {
 	const planned = minutesToClock(plannedTime);
 	const dayOffset = info?.dayOffset ?? 0;
 	const samples = info?.samples ?? null;
 	const catchBufferSeconds = info?.catchBufferSec ?? null;
 	if (!info || info.delaySec == null) {
-		return { planned, dayOffset, actual: null, delaySeconds: null, delay: null, samples, catchBufferSeconds };
+		return {
+			planned,
+			dayOffset,
+			actual: null,
+			delaySeconds: null,
+			delay: null,
+			samples,
+			catchBufferSeconds
+		};
 	}
 	const actualSeconds = (plannedTime % (24 * 60)) * 60 + info.delaySec;
 	return {

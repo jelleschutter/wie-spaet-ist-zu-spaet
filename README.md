@@ -1,42 +1,170 @@
-# sv
+# Wie spät ist zu spät?
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+Finde heraus, wie viel Verspätung du dir leisten kannst: für die nächste Abfahrt
+an einer Haltestelle zeigt die Seite, wie lange nach der planmässigen Abfahrtszeit
+du noch eintreffen kannst und den Kurs in etwa 9 von 10 Fällen trotzdem erwischst.
 
-## Creating a project
+Die App läuft **vollständig im Browser** — [minotor](https://minotor.dev) liest den
+Fahrplan clientseitig, die Verspätungsstatistik liegt als vorberechnete Binärdaten
+daneben. Es gibt keinen Backend-Code und keine API: `npm run build` erzeugt einen
+Ordner statischer Dateien, den GitHub Pages (oder jeder andere Static-Host)
+ausliefern kann.
 
-If you're seeing this, you've probably already done this step. Congrats!
+## Datenpipeline
+
+Alles, was vor dem Deployment läuft, ist Python (`uv`-verwaltet):
 
 ```sh
-# create a new project
-npx sv create my-app
+npm run data:build          # = uv run --project pipeline python pipeline/build.py
 ```
 
-To recreate this project with the same configuration:
+Drei Schritte, jeder einzeln aufrufbar (`--only`) und jeder fortsetzbar:
 
-```sh
-# recreate this project
-npx sv@0.16.6 create --template minimal --types ts --install npm wie-spaet-ist-zu-spaet
+| Schritt | Quelle | Ergebnis | Dauer |
+| --- | --- | --- | --- |
+| `download` | [geops GTFS](https://gtfs.geops.ch/dl/gtfs_complete.zip) (165 MB) und 12 Monats­archive [Ist-Daten](https://archive.opentransportdata.swiss/istdaten/) (je ~1.2 GB) | `data/raw/` | ~10 min |
+| `timetables` | GTFS | `stops.bin.gz` + 7× `timetable.<wochentag>.bin.gz` | ~9 min pro Wochentag |
+| `delays` | Ist-Daten | `delays/<wochentag>/<n>.bin.gz` | ~20 s pro Kalendertag |
+
+Nützliche Flags: `--days 3` (nur drei Ist-Daten-Tage, für einen schnellen
+Durchlauf), `--months 1`, `--only delays`, `--force`, `--today 2026-08-17`,
+`--prune` (jedes Monatsarchiv erst kurz vor dem Lesen holen und danach wieder
+löschen — hält den Spitzenplatzbedarf bei einem Monat statt ~15 GB, dafür lädt
+der nächste Lauf erneut herunter; CI baut damit).
+
+### Fahrplan: ein Datum pro Wochentag
+
+Die App beantwortet „was fährt als nächstes“, deshalb steht für jeden Wochentag
+das Datum, das **heute am nächsten liegt** — heute selbst für den heutigen
+Wochentag, sonst höchstens drei Tage entfernt. Damit bleibt jeder Fahrplan im
+Fenster der letzten und der nächsten sieben Tage und beschreibt den aktuellen
+Betrieb statt einer beliebigen Woche des Jahresfahrplans. Feiertage werden dabei
+übersprungen (siehe unten).
+
+### Verspätungen: warum vorberechnet
+
+Zwölf Monate Ist-Daten sind ~15 GB gezippt und entpacken zu rund 210 GB — ein
+CSV pro Kalendertag mit je ~2.4 Mio. Halt-Ereignissen. Für die eigentliche Frage
+braucht es pro geplanter Abfahrt aber nur sechs Zahlen. Deshalb:
+
+1. **pro Tag** reduziert DuckDB das CSV auf `(BPUIC, Linie, Planminute,
+   Tagesoffset, Verspätung)` in einer kleinen zstd-Parquet-Datei — nur echte
+   Abfahrten, ohne Ausfälle, Durchfahrten und Zusatzfahrten;
+2. **pro Wochentag** aggregiert DuckDB dessen ~52 Parquet-Dateien zu einer Zeile
+   je Kurs: Anzahl Messungen, Durchschnitt und Verspätungspuffer;
+3. jede Zeile wird zu **10 Bytes** und nach Haltestelle in 1024 Shards pro
+   Wochentag gruppiert, gzip-komprimiert.
+
+Ergebnis: eine Abfrage lädt genau einen Shard (~20 KB) statt des Datensatzes.
+
+Der **Verspätungspuffer** ist der grösste Wert B, bei dem der Kurs an mindestens
+90 % der gemessenen Tage um B oder mehr verspätet abgefahren ist — komm B
+Sekunden nach der Planzeit und du erwischst ihn in etwa 9 von 10 Fällen. Das ist
+die k-kleinste beobachtete Verspätung mit k = n / 10 (abgerundet), also *nearest
+rank* und nicht interpoliert: `quantile_cont` würde zwischen zwei Messungen einen
+Wert erfinden, den die Daten bei wenigen Messungen nicht stützen (bei den Werten
+−30 s und +150 s käme −12 s heraus, was auf 1 von 2 Tagen zutrifft, nicht auf
+90 %). Ein negativer Puffer heisst: sei entsprechend früher da.
+
+Der Join läuft über die **BPUIC**: die GTFS-Haltestellen-IDs sind
+`<bpuic>[:<perron>]`, und die Ist-Daten führen dieselbe Nummer. Der Browser
+braucht dafür nur die Zahl vor dem Doppelpunkt — kein SLOID, kein DIDOK-Sidecar.
+(Die Ist-Daten mischen 7-stellige Haltestellen- und 9-stellige Perron-Nummern;
+die Pipeline kürzt auf die ersten sieben Stellen.)
+
+### Feiertage gelten als Sonntag
+
+An den landesweiten Feiertagen fährt der Sonntagsfahrplan. Neujahr,
+Berchtoldstag, Karfreitag, Ostermontag, Auffahrt, Pfingstmontag, Bundesfeier,
+Weihnachten und Stephanstag werden deshalb sowohl bei der Aggregation als auch
+bei der Abfrage als Sonntag behandelt — `pipeline/holidays.py` und
+`src/lib/transit/holidays.ts` müssen dazu übereinstimmen.
+
+## Aufbau
+
+```
+pipeline/                 Python-Pipeline (uv)
+  build.py                Orchestrierung + CLI
+  download.py             GTFS und Ist-Daten holen (resumable)
+  timetables.py           minotor-CLI pro Wochentag aufrufen
+  delays.py               Ist-Daten aggregieren und Shards schreiben
+  holidays.py             landesweite Feiertage
+  layout.py               Pfade, Konstanten, Binärformat
+
+data/                     nicht im Git
+  raw/                    heruntergeladene Feeds (~15 GB)
+  work/                   Parquet-Zwischenstand, entpackte .bin-Dateien
+
+static/data/              ausgeliefertes Bündel (nicht im Git, 212 MB, 7177 Dateien)
+  stops.bin.gz            1.4 MB
+  timetable.<tag>.bin.gz  5.0 MB (So) bis 7.8 MB (Fr), zusammen 49 MB
+  delays/<tag>/<n>.bin.gz 1024 Shards pro Wochentag, zusammen 158 MB
+  meta.json               Wochentage, Abdeckung, globale Linientabelle
+
+src/lib/transit/          die Logik, die früher auf dem Server lief
+  planner.ts              Abfahrtstafel für eine Haltestelle (minotor im Browser)
+  delays.ts               Verspätungs-Shards laden und Abfahrten zuordnen
+  assets.ts               Laden + gzip-Dekomprimierung des Datenbündels
+  holidays.ts / time.ts   Feiertage und Zeit-Helfer
 ```
 
-## Developing
+Was der Browser lädt: `meta.json` (~20 KB) plus den Haltestellen-Index (1.4 MB)
+beim ersten Tippen, einen Fahrplan (5–8 MB) bei der ersten Abfrage eines
+Wochentags, danach ~20 KB pro Haltestelle. Alles bleibt für die Session im
+Speicher; eine zweite Abfrage am selben Wochentag dauert ~10 ms.
 
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+Ein Durchlauf über 12 Monate ergibt 26.6 Mio. Kurse (3.2–4.2 Mio. pro
+Wochentag) an 24 755 Haltestellen. Der Median liegt bei 20–32 Messungen pro
+Kurs — weniger als die 49–61 erfassten Tage, weil der Jahresfahrplanwechsel im
+Dezember mitten im Zeitraum liegt. Wer das Bündel kleiner will, wirft mit
+`--min-samples 10` die dünn belegten Kurse weg (76 % bleiben, ~121 MB statt
+158 MB).
+
+## Entwicklung
 
 ```sh
+npm install
+npm run data:build     # nur nötig, wenn die Daten neu sollen
 npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
 ```
 
-## Building
+`npm run check` prüft Typen, `npm run build` erzeugt `build/`, `npm run preview`
+serviert diesen Ordner lokal.
 
-To create a production version of your app:
+## Deployment auf GitHub Pages
 
-```sh
-npm run build
-```
+`.github/workflows/deploy.yml` baut die Seite bei jedem Push auf `main` und
+veröffentlicht sie über GitHub Pages (Settings → Pages → Source: *GitHub Actions*).
+Der Basispfad wird automatisch gesetzt: `/<repo>` für eine Projekt-Seite,
+kein Präfix bei einer User-Seite oder wenn `static/CNAME` existiert. Lokal lässt
+sich das mit `BASE_PATH=/wie-spaet-ist-zu-spaet npm run build` nachstellen.
 
-You can preview the production build with `npm run preview`.
+### Die Daten baut CI
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+**`static/data/` liegt nicht im Git** — 212 MB in 7177 Dateien, und jede
+Aktualisierung würde dieselbe Menge noch einmal in die History legen. Stattdessen
+erzeugt der Workflow das Bündel selbst, in zwei Jobs, die parallel laufen und
+ihre Hälfte getrennt cachen:
+
+| Job | Dauer (kalt) | Cache-Key | rebaut sich |
+| --- | --- | --- | --- |
+| `timetables` | ~70 min | Kalenderwoche | wöchentlich |
+| `delays` | ~3 h | Monat | monatlich |
+
+Die beiden Takte kommen von den Quellen: der GTFS-Feed wird täglich neu gebaut
+und „nächste Gelegenheit jedes Wochentags“ wandert mit dem Datum, während die
+Ist-Daten als Monatsarchive erscheinen und dazwischen unverändert bleiben. Ein
+normaler Push trifft beide Caches und ist in wenigen Minuten deployt; nur der
+erste Lauf einer Woche (bzw. eines Monats) zahlt einen Neubau. Der Montags-Cron
+sorgt dafür, dass dieser Neubau dort landet statt auf einem Push — und hält beide
+Caches innerhalb der 7-Tage-Frist, nach der GitHub sie sonst verwirft.
+
+Der `delays`-Job holt jedes Monatsarchiv einzeln (`--prune`) und löscht es sofort
+wieder, sonst würden die 15 GB Rohdaten den Runner sprengen. Sein Monatsfenster
+ist vier Tage zurück verankert (`--today`), weil das Archiv eines Monats erst ein
+paar Tage nach dessen Ende veröffentlicht wird: der Key springt am 5. um, wenn
+der abgeschlossene Monat sicher abrufbar ist.
+
+Jede Hälfte schreibt ihre eigene `meta.json` — der `build`-Job führt beide mit
+`jq` zusammen, bevor `npm run build` läuft. Einen Neubau erzwingt man über
+*Run workflow* → `rebuild: timetables | delays | everything`.

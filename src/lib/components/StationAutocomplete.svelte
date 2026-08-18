@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { planner } from '$lib/transit';
+
 	type Suggestion = {
 		id: number;
 		name: string;
@@ -24,12 +26,13 @@
 			return;
 		}
 		try {
-			const res = await fetch('/api/stations?limit=7&q=' + encodeURIComponent(q));
-			const data = await res.json();
-			suggestions = data.results ?? [];
+			const results = await planner.searchStations({ q, limit: 7 });
+			// A slower earlier lookup must not overwrite a newer query's results.
+			if (q !== value) return;
+			suggestions = results;
 			open = suggestions.length > 0;
 		} catch {
-			/* transient network error — leave the dropdown as-is */
+			/* stops index still loading or unavailable — leave the dropdown as-is */
 		}
 	}
 
@@ -64,9 +67,9 @@
 			async (pos) => {
 				try {
 					const { latitude, longitude } = pos.coords;
-					const res = await fetch(`/api/stations?lat=${latitude}&lon=${longitude}&limit=1`);
-					const data = await res.json();
-					const nearest = data.results?.[0];
+					const nearest = (
+						await planner.searchStations({ lat: latitude, lon: longitude, limit: 1 })
+					)[0];
 					if (nearest) {
 						value = nearest.name;
 						stationId = String(nearest.id);

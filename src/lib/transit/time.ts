@@ -1,3 +1,5 @@
+import { isHoliday } from './holidays';
+
 // ---------------------------------------------------------------------------
 // Time helpers
 //
@@ -5,7 +7,26 @@
 // services running past midnight). Ported from transit-router's src/time.js.
 // ---------------------------------------------------------------------------
 
-export type DayType = 'weekday' | 'saturday' | 'sunday';
+/** The data bundle is split per calendar weekday, not per weekday/weekend class. */
+export type DayType =
+	| 'monday'
+	| 'tuesday'
+	| 'wednesday'
+	| 'thursday'
+	| 'friday'
+	| 'saturday'
+	| 'sunday';
+
+/** Day types in `Date.getDay()` order, so index 0 is Sunday. */
+const DAY_TYPES_BY_DOW: readonly DayType[] = [
+	'sunday',
+	'monday',
+	'tuesday',
+	'wednesday',
+	'thursday',
+	'friday',
+	'saturday'
+];
 
 /** Zero-pads a number to two digits. */
 export function pad2(n: number): string {
@@ -38,14 +59,13 @@ export function secondsToClock(totalSeconds: number): string {
 }
 
 /**
- * The delay day type of a Date: 'weekday' (Mon-Fri), 'saturday', or 'sunday'.
- * Mirrors how transit-router's aggregate.py buckets days; no holiday calendar.
+ * The day type of a Date: its weekday, except that Swiss nationwide holidays
+ * run the Sunday timetable and are bucketed as Sunday - exactly how the
+ * pipeline groups the Ist-Daten, so a lookup sees matching delays.
  */
 export function dayTypeOf(date: Date): DayType {
-	const dow = date.getDay(); // 0 = Sunday ... 6 = Saturday
-	if (dow === 0) return 'sunday';
-	if (dow === 6) return 'saturday';
-	return 'weekday';
+	if (isHoliday(date)) return 'sunday';
+	return DAY_TYPES_BY_DOW[date.getDay()];
 }
 
 /** Human-readable delay: "+1m 52s late", "-30s early", "on time". */

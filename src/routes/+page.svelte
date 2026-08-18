@@ -3,33 +3,39 @@
 	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import StationAutocomplete from '$lib/components/StationAutocomplete.svelte';
+	import {
+		dayTypeOf,
+		holidayName,
+		planner,
+		TransitError,
+		type DayType,
+		type DepartureDto
+	} from '$lib/transit';
 
-	type DayType = 'weekday' | 'saturday' | 'sunday';
 	const DAY_TYPE_LABELS: Record<DayType, string> = {
-		weekday: 'Werktag',
+		monday: 'Montag',
+		tuesday: 'Dienstag',
+		wednesday: 'Mittwoch',
+		thursday: 'Donnerstag',
+		friday: 'Freitag',
 		saturday: 'Samstag',
 		sunday: 'Sonntag'
 	};
 
-	type StopDto = { id: number; name: string; platform: string | null };
-	type DepartureDto = {
-		line: string;
-		mode: string;
-		from: StopDto;
-		destination: StopDto | null;
-		plannedDeparture: string;
-		departure: { catchBufferSeconds: number | null; samples: number | null };
-	};
 	type QueryMeta = { stationId: string; stationName: string; time: string; dayType: DayType };
 
 	const TAGLINE = 'Finde heraus, wie viel Verspätung du dir leisten kannst.';
+
+	// Nationwide holidays run the Sunday timetable, so the day type defaults to
+	// Sonntag on one - worth saying out loud rather than looking like a bug.
+	const todaysHoliday = holidayName(new Date());
 
 	let screen = $state<'form' | 'select' | 'result'>('form');
 	let stationName = $state('');
 	let stationId = $state<string | null>(null);
 	let time = $state('');
-	let dayType = $state<DayType>('weekday');
-	let serviceDays = $state<DayType[]>(['weekday']);
+	let dayType = $state<DayType>(dayTypeOf(new Date()));
+	let serviceDays = $state<DayType[]>([dayTypeOf(new Date())]);
 	let delaysReady = $state(false);
 	let delayInfo = $state(TAGLINE);
 	let statusMsg = $state('');
@@ -47,11 +53,6 @@
 		return String(n).padStart(2, '0');
 	}
 
-	function dayTypeOfNow(): DayType {
-		const d = new Date().getDay();
-		return d === 0 ? 'sunday' : d === 6 ? 'saturday' : 'weekday';
-	}
-
 	function updateTimeToNow() {
 		const now = new Date();
 		time = pad2(now.getHours()) + ':' + pad2(now.getMinutes());
@@ -59,8 +60,8 @@
 
 	function resetDefaults() {
 		updateTimeToNow();
-		const today = dayTypeOfNow();
-		dayType = serviceDays.includes(today) ? today : (serviceDays[0] ?? 'weekday');
+		const today = dayTypeOf(new Date());
+		dayType = serviceDays.includes(today) ? today : (serviceDays[0] ?? today);
 	}
 
 	function fmtDuration(abs: number) {
@@ -99,8 +100,8 @@
 				num: '—',
 				label: 'keine Prognose möglich',
 				note: delaysReady
-					? 'Für diese Verbindung liegen noch keine Verspätungsdaten vor.'
-					: 'Die Daten werden noch geladen — versuch es gleich nochmal.'
+					? 'Für diese Verbindung liegen keine Verspätungsdaten vor.'
+					: 'Für diesen Fahrplan liegen keine Verspätungsdaten vor.'
 			};
 		}
 		if (sec > 0) {
@@ -149,26 +150,26 @@
 
 	async function runSearch(meta: QueryMeta, pick?: { line: string; dest: string | null }) {
 		busy = true;
-		statusMsg = 'Suche läuft …';
+		// The first lookup of a day type pulls in its timetable (a few MB), which
+		// takes noticeably longer than the search itself — say so.
+		statusMsg = planner.isReady(meta.dayType) ? 'Suche läuft …' : 'Fahrplandaten werden geladen …';
 		statusError = false;
 		try {
-			const params = new URLSearchParams({ from: meta.stationId, time: meta.time, dayType: meta.dayType });
-			const res = await fetch('/api/departures?' + params);
-			const data = await res.json();
-			if (data.error) {
-				statusMsg = data.error;
-				statusError = true;
-				return;
-			}
+			const data = await planner.getDepartures({
+				from: meta.stationId,
+				time: meta.time,
+				dayType: meta.dayType
+			});
 			if (!data.results.length) {
 				statusMsg = `Keine weiteren Abfahrten ab ${meta.stationName || meta.stationId} nach ${meta.time} Uhr an diesem Tag.`;
 				statusError = true;
 				return;
 			}
 			statusMsg = '';
-			const preselected: DepartureDto | undefined = pick
+			resultDayType = data.dayType;
+			const preselected = pick
 				? data.results.find(
-						(r: DepartureDto) =>
+						(r) =>
 							r.line === pick.line && (pick.dest == null || String(r.destination?.id) === pick.dest)
 					)
 				: undefined;
@@ -178,12 +179,15 @@
 				showResult(data.results[0], meta, data.dayType);
 			} else {
 				selectResults = data.results;
-				selectTime = data.nextDepartureTime;
+				selectTime = data.nextDepartureTime ?? meta.time;
 				queryMeta = meta;
 				screen = 'select';
 			}
 		} catch (err) {
-			statusMsg = 'Anfrage fehlgeschlagen: ' + (err as Error).message;
+			statusMsg =
+				err instanceof TransitError
+					? err.message
+					: 'Anfrage fehlgeschlagen: ' + (err as Error).message;
 			statusError = true;
 		} finally {
 			busy = false;
@@ -236,15 +240,15 @@
 
 	onMount(() => {
 		(async () => {
+			// Start pulling the stops index in while the form is being filled in.
+			planner.prewarm();
 			try {
-				const res = await fetch('/api/health');
-				const h = await res.json();
-				const d = h.delays ?? {};
-				delaysReady = Boolean(d.ready);
-				delayInfo = delaysReady ? TAGLINE : 'Die Daten werden geladen …';
-				serviceDays = h.routing?.serviceDays?.length ? h.routing.serviceDays : ['weekday'];
+				const meta = await planner.meta();
+				delaysReady = (meta.delays?.dayTypes?.length ?? 0) > 0;
+				serviceDays = meta.serviceDays?.length ? meta.serviceDays : [dayTypeOf(new Date())];
 			} catch {
-				serviceDays = ['weekday'];
+				serviceDays = [dayTypeOf(new Date())];
+				delayInfo = 'Die Fahrplandaten konnten nicht geladen werden.';
 			}
 			resetDefaults();
 
@@ -295,6 +299,9 @@
 						<option value={t}>{DAY_TYPE_LABELS[t]}</option>
 					{/each}
 				</select>
+				{#if todaysHoliday}
+					<p class="sub">Heute ist {todaysHoliday} — es gilt der Sonntagsfahrplan.</p>
+				{/if}
 			</div>
 			<button class="go" type="submit" disabled={busy}>Berechnen</button>
 		</form>

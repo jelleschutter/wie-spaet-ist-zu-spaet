@@ -1,7 +1,15 @@
 node_modules
 
-# Timetable/delay data (large binaries + CSVs, fetched from transit-router)
+# Everything the data pipeline touches: the downloaded feeds (~15 GB) and the
+# bundle built from them (212 MB in 7177 files). CI rebuilds static/data/ before
+# the frontend build, see .github/workflows/deploy.yml.
 /data
+/static/data
+
+# Python pipeline
+pipeline/.venv
+__pycache__
+*.pyc
 
 # Output
 .output
