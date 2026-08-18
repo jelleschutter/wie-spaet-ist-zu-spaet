@@ -10,6 +10,8 @@ export type {
 	DeparturesResult,
 	DepartureDto,
 	DepartureEventDto,
+	DepartureListResult,
+	Direction,
 	StaticMeta,
 	StopDto
 } from './planner';

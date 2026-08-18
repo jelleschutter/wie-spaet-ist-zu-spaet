@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { page } from '$app/state';
 	import { replaceState } from '$app/navigation';
 	import StationAutocomplete from '$lib/components/StationAutocomplete.svelte';
 	import {
@@ -9,7 +8,8 @@
 		planner,
 		TransitError,
 		type DayType,
-		type DepartureDto
+		type DepartureDto,
+		type Direction
 	} from '$lib/transit';
 
 	const DAY_TYPE_LABELS: Record<DayType, string> = {
@@ -26,11 +26,17 @@
 
 	const TAGLINE = 'Finde heraus, wie viel Verspätung du dir leisten kannst.';
 
+	/** How many connections one "Früher"/"Später" step shows. */
+	const PAGE_SIZE = 5;
+
+	/** How many either side of the current departure "Alternative Verbindungen" opens with. */
+	const AROUND_SIZE = 2;
+
 	// Nationwide holidays run the Sunday timetable, so the day type defaults to
 	// Sonntag on one - worth saying out loud rather than looking like a bug.
 	const todaysHoliday = holidayName(new Date());
 
-	let screen = $state<'form' | 'select' | 'result'>('form');
+	let screen = $state<'form' | 'select' | 'result' | 'list'>('form');
 	let stationName = $state('');
 	let stationId = $state<string | null>(null);
 	let time = $state('');
@@ -43,6 +49,11 @@
 	let busy = $state(false);
 	let selectResults = $state<DepartureDto[]>([]);
 	let selectTime = $state('');
+	let listResults = $state<DepartureDto[]>([]);
+	// Where the shown page begins and ends, in minutes: the anchors the next
+	// "Früher"/"Später" pages off. Clock strings can't serve, they wrap at 24:00.
+	let listEarliest = $state<number | null>(null);
+	let listLatest = $state<number | null>(null);
 	let result = $state<DepartureDto | null>(null);
 	let resultDayType = $state<DayType | null>(null);
 	let queryMeta = $state<QueryMeta | null>(null);
@@ -129,14 +140,19 @@
 	}
 
 	function buildShareUrl(dto: DepartureDto, meta: QueryMeta): URL {
+		const params = new URLSearchParams();
+		params.set('station', meta.stationId);
+		params.set('stationName', meta.stationName);
+		params.set('time', meta.time);
+		params.set('dayType', meta.dayType);
+		params.set('line', dto.line);
+		if (dto.destination?.id != null) params.set('dest', String(dto.destination.id));
+		// The deep link lives in the fragment, which never reaches the server: every
+		// shared link is then the same URL to a cache, instead of one entry per
+		// query string that can only ever miss.
 		const url = new URL(location.href);
 		url.search = '';
-		url.searchParams.set('station', meta.stationId);
-		url.searchParams.set('stationName', meta.stationName);
-		url.searchParams.set('time', meta.time);
-		url.searchParams.set('dayType', meta.dayType);
-		url.searchParams.set('line', dto.line);
-		if (dto.destination?.id != null) url.searchParams.set('dest', String(dto.destination.id));
+		url.hash = params.toString();
 		return url;
 	}
 
@@ -194,6 +210,81 @@
 		}
 	}
 
+	/** The minutes the shown departures span, whichever screen is showing them. */
+	function shownWindow(): { earliest: number; latest: number } | null {
+		if (screen === 'list' && listEarliest != null && listLatest != null) {
+			return { earliest: listEarliest, latest: listLatest };
+		}
+		const single =
+			screen === 'result' ? result : screen === 'select' ? selectResults[0] : null;
+		if (!single) return null;
+		return {
+			earliest: single.plannedDepartureMinutes,
+			latest: single.plannedDepartureMinutes
+		};
+	}
+
+	async function showPage(direction: Direction, at: number, limit: number) {
+		if (!queryMeta) return;
+		busy = true;
+		statusMsg = '';
+		statusError = false;
+		try {
+			const data = await planner.getDepartureList({
+				from: queryMeta.stationId,
+				at,
+				dayType: queryMeta.dayType,
+				direction,
+				limit
+			});
+			if (!data.results.length) {
+				statusMsg =
+					direction === 'earlier'
+						? 'Keine früheren Abfahrten an diesem Tag.'
+						: 'Keine späteren Abfahrten an diesem Tag.';
+				statusError = true;
+				return;
+			}
+			listResults = data.results;
+			listEarliest = data.earliest;
+			listLatest = data.latest;
+			resultDayType = data.dayType;
+			screen = 'list';
+		} catch (err) {
+			statusMsg =
+				err instanceof TransitError
+					? err.message
+					: 'Anfrage fehlgeschlagen: ' + (err as Error).message;
+			statusError = true;
+		} finally {
+			busy = false;
+		}
+	}
+
+	function goEarlier() {
+		const window = shownWindow();
+		if (window) showPage('earlier', window.earliest, PAGE_SIZE);
+	}
+
+	function goLater() {
+		// A page always holds whole minutes, so starting one minute past the last
+		// one shown skips exactly what's already on screen.
+		const window = shownWindow();
+		if (window) showPage('later', window.latest + 1, PAGE_SIZE);
+	}
+
+	function showAlternatives() {
+		const window = shownWindow();
+		if (window) showPage('around', window.earliest, AROUND_SIZE);
+	}
+
+	function pick(dto: DepartureDto, paged: boolean) {
+		const meta = queryMeta as QueryMeta;
+		// A departure picked off a page is no longer the one the original query
+		// asked for, so the shared link has to point at its time instead.
+		showResult(dto, paged ? { ...meta, time: dto.plannedDeparture } : meta, resultDayType);
+	}
+
 	function submit(e: SubmitEvent) {
 		e.preventDefault();
 		const id = stationId ?? stationName.trim();
@@ -209,6 +300,9 @@
 		replaceState(location.pathname, {});
 		result = null;
 		selectResults = [];
+		listResults = [];
+		listEarliest = null;
+		listLatest = null;
 		queryMeta = null;
 		statusMsg = '';
 		// Keep the station and day type as they were; only the time needs to
@@ -252,7 +346,8 @@
 			}
 			resetDefaults();
 
-			const params = page.url.searchParams;
+			// Links shared before the move to the fragment still carry a query string.
+			const params = new URLSearchParams(location.hash.slice(1) || location.search.slice(1));
 			const sId = params.get('station');
 			if (!sId) return;
 			const meta: QueryMeta = {
@@ -307,25 +402,48 @@
 		</form>
 	{/if}
 
+	{#snippet departureList(items: DepartureDto[], paged: boolean)}
+		<div class="select-list">
+			{#each items as r (r.plannedDepartureMinutes + ':' + r.line + ':' + (r.destination?.id ?? ''))}
+				<button type="button" class="select-item" onclick={() => pick(r, paged)}>
+					{#if paged}
+						<span class="select-time">{r.plannedDeparture}</span>
+					{/if}
+					<span class="badge mode-{r.mode || 'OTHER'}">{r.line}</span>
+					<span class="select-body">
+						<span class="select-dest">→ {r.destination?.name ?? '?'}</span>
+						<span class="select-meta">{prettyMode(r.mode)}{platformLabel(r.from.platform)}</span>
+					</span>
+				</button>
+			{/each}
+		</div>
+	{/snippet}
+
+	{#snippet alternativesButton()}
+		<button class="pager" type="button" onclick={showAlternatives} disabled={busy}>
+			Alternative Verbindungen
+		</button>
+	{/snippet}
+
 	{#if screen === 'select'}
 		<div class="card">
 			<h2>Mehrere Abfahrten um {selectTime} Uhr</h2>
 			<p class="sub">Welche Verbindung nimmst du?</p>
-			<div class="select-list">
-				{#each selectResults as r (r.line + ':' + (r.destination?.id ?? ''))}
-					<button
-						type="button"
-						class="select-item"
-						onclick={() => showResult(r, queryMeta as QueryMeta, resultDayType)}
-					>
-						<span class="badge mode-{r.mode || 'OTHER'}">{r.line}</span>
-						<span class="select-body">
-							<span class="select-dest">→ {r.destination?.name ?? '?'}</span>
-							<span class="select-meta">{prettyMode(r.mode)}{platformLabel(r.from.platform)}</span>
-						</span>
-					</button>
-				{/each}
-			</div>
+			{@render departureList(selectResults, false)}
+			{@render alternativesButton()}
+		</div>
+	{/if}
+
+	{#if screen === 'list' && listResults.length}
+		<div class="card">
+			<h2>Verbindungen ab {queryMeta?.stationName || 'der Haltestelle'}</h2>
+			<p class="sub">
+				{listResults[0].plannedDeparture} – {listResults[listResults.length - 1]
+					.plannedDeparture} Uhr{#if resultDayType}, {DAY_TYPE_LABELS[resultDayType]}{/if}
+			</p>
+			<button class="pager" type="button" onclick={goEarlier} disabled={busy}>↑ Früher</button>
+			{@render departureList(listResults, true)}
+			<button class="pager" type="button" onclick={goLater} disabled={busy}>↓ Später</button>
 		</div>
 	{/if}
 
@@ -349,6 +467,7 @@
 					</span>
 				</span>
 			</div>
+			{@render alternativesButton()}
 			<div class="actions">
 				<button class="secondary" type="button" onclick={share}>Teilen</button>
 				<button class="go" type="button" onclick={goAgain}>Nochmal</button>
