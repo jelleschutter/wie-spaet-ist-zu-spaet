@@ -1,15 +1,13 @@
 node_modules
 
-# Everything the data pipeline touches: the downloaded feeds (~15 GB) and the
+# Everything the data pipeline touches: the downloaded feeds (~16 GB) and the
 # bundle built from them (212 MB in 7177 files). CI rebuilds static/data/ before
 # the frontend build, see .github/workflows/deploy.yml.
 /data
 /static/data
 
-# Python pipeline
+# Leftovers of the Python pipeline this repo used to have; safe to delete.
 pipeline/.venv
-__pycache__
-*.pyc
 
 # Output
 .output

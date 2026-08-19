@@ -12,24 +12,26 @@ ausliefern kann.
 
 ## Datenpipeline
 
-Alles, was vor dem Deployment läuft, ist Python (`uv`-verwaltet):
+Alles, was vor dem Deployment läuft, ist **Node ohne Abhängigkeiten** — die
+Standardbibliothek bringt alles mit, was die Pipeline braucht (`node:zlib` liefert
+zstd und gzip, ein knappes ZIP-Modul in `pipeline/zip.js` liest die Archive):
 
 ```sh
-npm run data:build          # = uv run --project pipeline python pipeline/build.py
+npm run data:build          # = node pipeline/build.js
 ```
 
 Drei Schritte, jeder einzeln aufrufbar (`--only`) und jeder fortsetzbar:
 
 | Schritt | Quelle | Ergebnis | Dauer |
 | --- | --- | --- | --- |
-| `download` | [geops GTFS](https://gtfs.geops.ch/dl/gtfs_complete.zip) (165 MB) und 12 Monats­archive [Ist-Daten](https://archive.opentransportdata.swiss/istdaten/) (je ~1.2 GB) | `data/raw/` | ~10 min |
+| `download` | [geops GTFS](https://gtfs.geops.ch/dl/gtfs_complete.zip) (165 MB) und 12 Monats­archive [Ist-Daten](https://archive.opentransportdata.swiss/istdaten/) (je ~1.3 GB) | `data/raw/` | ~10 min |
 | `timetables` | GTFS | `stops.bin.gz` + 7× `timetable.<wochentag>.bin.gz` | ~9 min pro Wochentag |
-| `delays` | Ist-Daten | `delays/<wochentag>/<n>.bin.gz` | ~20 s pro Kalendertag |
+| `delays` | Ist-Daten | `delays/<wochentag>/<n>.bin.gz` | ~2 s pro Kalendertag, 12 Monate in ~18 min |
 
 Nützliche Flags: `--days 3` (nur drei Ist-Daten-Tage, für einen schnellen
 Durchlauf), `--months 1`, `--only delays`, `--force`, `--today 2026-08-17`,
 `--prune` (jedes Monatsarchiv erst kurz vor dem Lesen holen und danach wieder
-löschen — hält den Spitzenplatzbedarf bei einem Monat statt ~15 GB, dafür lädt
+löschen — hält den Spitzenplatzbedarf bei einem Monat statt ~16 GB, dafür lädt
 der nächste Lauf erneut herunter; CI baut damit).
 
 ### Fahrplan: ein Datum pro Wochentag
@@ -43,15 +45,20 @@ Betrieb statt einer beliebigen Woche des Jahresfahrplans. Feiertage werden dabei
 
 ### Verspätungen: warum vorberechnet
 
-Zwölf Monate Ist-Daten sind ~15 GB gezippt und entpacken zu rund 210 GB — ein
+Zwölf Monate Ist-Daten sind ~16 GB gezippt und entpacken zu rund 213 GB — ein
 CSV pro Kalendertag mit je ~2.4 Mio. Halt-Ereignissen. Für die eigentliche Frage
 braucht es pro geplanter Abfahrt aber nur sechs Zahlen. Deshalb:
 
-1. **pro Tag** reduziert DuckDB das CSV auf `(BPUIC, Linie, Planminute,
-   Tagesoffset, Verspätung)` in einer kleinen zstd-Parquet-Datei — nur echte
-   Abfahrten, ohne Ausfälle, Durchfahrten und Zusatzfahrten;
-2. **pro Wochentag** aggregiert DuckDB dessen ~52 Parquet-Dateien zu einer Zeile
-   je Kurs: Anzahl Messungen, Durchschnitt und Verspätungspuffer;
+1. **pro Tag** wird das CSV direkt aus dem ZIP gestreamt und auf `(BPUIC, Linie,
+   Planminute, Tagesoffset, Verspätung)` reduziert — nur echte Abfahrten, ohne
+   Ausfälle, Durchfahrten und Zusatzfahrten. Der Parser liest Bytes statt Strings:
+   für die ~12 Spalten, die wieder wegfliegen, wird nichts dekodiert, gesplittet
+   oder alloziert. Ergebnis ist eine kleine zstd-Datei je Kalendertag;
+2. **pro Wochentag** werden dessen ~52 Tagesdateien zu einer Zeile je Kurs
+   aggregiert: Anzahl Messungen, Durchschnitt und Verspätungspuffer. Das läuft in
+   vier Durchgängen über `bpuic % 4` (`--chunks`), weil der exakte Perzentilwert
+   alle Messungen einer Gruppe gleichzeitig im Speicher braucht — ein Wochentag
+   sind ~117 Mio. Zeilen;
 3. jede Zeile wird zu **10 Bytes** und nach Haltestelle in 1024 Shards pro
    Wochentag gruppiert, gzip-komprimiert.
 
@@ -61,10 +68,15 @@ Der **Verspätungspuffer** ist der grösste Wert B, bei dem der Kurs an mindeste
 90 % der gemessenen Tage um B oder mehr verspätet abgefahren ist — komm B
 Sekunden nach der Planzeit und du erwischst ihn in etwa 9 von 10 Fällen. Das ist
 die k-kleinste beobachtete Verspätung mit k = n / 10 (abgerundet), also *nearest
-rank* und nicht interpoliert: `quantile_cont` würde zwischen zwei Messungen einen
-Wert erfinden, den die Daten bei wenigen Messungen nicht stützen (bei den Werten
-−30 s und +150 s käme −12 s heraus, was auf 1 von 2 Tagen zutrifft, nicht auf
-90 %). Ein negativer Puffer heisst: sei entsprechend früher da.
+rank* und nicht interpoliert: ein interpolierendes Perzentil würde zwischen zwei
+Messungen einen Wert erfinden, den die Daten bei wenigen Messungen nicht stützen
+(bei den Werten −30 s und +150 s käme −12 s heraus, was auf 1 von 2 Tagen
+zutrifft, nicht auf 90 %). Ein negativer Puffer heisst: sei entsprechend früher
+da.
+
+Erscheint ein Kurs unter mehreren Tagesoffsets, gewinnt der besser belegte; bei
+gleichem Stand der Offset, der näher am Betriebstag liegt. Diese zweite Regel gibt
+es, damit die Ausgabe nicht von der Lesereihenfolge abhängt.
 
 Der Join läuft über die **BPUIC**: die GTFS-Haltestellen-IDs sind
 `<bpuic>[:<perron>]`, und die Ist-Daten führen dieselbe Nummer. Der Browser
@@ -76,28 +88,29 @@ die Pipeline kürzt auf die ersten sieben Stellen.)
 
 An den landesweiten Feiertagen fährt der Sonntagsfahrplan. Neujahr,
 Berchtoldstag, Karfreitag, Ostermontag, Auffahrt, Pfingstmontag, Bundesfeier,
-Weihnachten und Stephanstag werden deshalb sowohl bei der Aggregation als auch
-bei der Abfrage als Sonntag behandelt — `pipeline/holidays.py` und
-`src/lib/transit/holidays.ts` müssen dazu übereinstimmen.
+Weihnachten und Stephanstag werden deshalb sowohl bei der Aggregation als auch bei
+der Abfrage als Sonntag behandelt. Die Pipeline importiert dafür direkt
+`src/lib/transit/holidays.ts` (Node 24 entfernt die Typen beim Laden selbst), es
+gibt also keine zweite Liste, die abweichen könnte.
 
 ## Aufbau
 
 ```
-pipeline/                 Python-Pipeline (uv)
-  build.py                Orchestrierung + CLI
-  download.py             GTFS und Ist-Daten holen (resumable)
-  timetables.py           minotor-CLI pro Wochentag aufrufen
-  delays.py               Ist-Daten aggregieren und Shards schreiben
-  holidays.py             landesweite Feiertage
-  layout.py               Pfade, Konstanten, Binärformat
+pipeline/                 Node-Pipeline, nur Standardbibliothek
+  build.js                Orchestrierung + CLI
+  download.js             GTFS und Ist-Daten holen (resumable)
+  timetables.js           minotor-CLI pro Wochentag aufrufen
+  delays.js               Ist-Daten aggregieren und Shards schreiben
+  zip.js                  ZIP lesen (Central Directory, ZIP64, streamend)
+  layout.js               Pfade, Konstanten, Binärformat
 
 data/                     nicht im Git
-  raw/                    heruntergeladene Feeds (~15 GB)
-  work/                   Parquet-Zwischenstand, entpackte .bin-Dateien
+  raw/                    heruntergeladene Feeds (~16 GB)
+  work/                   Tagesdateien (zstd), entpackte .bin-Dateien
 
-static/data/              ausgeliefertes Bündel (nicht im Git, 212 MB, 7177 Dateien)
-  stops.bin.gz            1.4 MB
-  timetable.<tag>.bin.gz  5.0 MB (So) bis 7.8 MB (Fr), zusammen 49 MB
+static/data/              ausgeliefertes Bündel (nicht im Git, 213 MB, 7177 Dateien)
+  stops.bin.gz            1.6 MB
+  timetable.<tag>.bin.gz  5.4 MB (So) bis 8.5 MB (Fr), zusammen 54 MB
   delays/<tag>/<n>.bin.gz 1024 Shards pro Wochentag, zusammen 158 MB
   meta.json               Wochentage, Abdeckung, globale Linientabelle
 
@@ -141,7 +154,7 @@ sich das mit `BASE_PATH=/wie-spaet-ist-zu-spaet npm run build` nachstellen.
 
 ### Die Daten baut CI
 
-**`static/data/` liegt nicht im Git** — 212 MB in 7177 Dateien, und jede
+**`static/data/` liegt nicht im Git** — 213 MB in 7177 Dateien, und jede
 Aktualisierung würde dieselbe Menge noch einmal in die History legen. Stattdessen
 erzeugt der Workflow das Bündel selbst, in zwei Jobs, die parallel laufen und
 ihre Hälfte getrennt cachen:
@@ -149,7 +162,10 @@ ihre Hälfte getrennt cachen:
 | Job | Dauer (kalt) | Cache-Key | rebaut sich |
 | --- | --- | --- | --- |
 | `timetables` | ~70 min | Kalenderwoche | wöchentlich |
-| `delays` | ~3 h | Monat | monatlich |
+| `delays` | ~50 min, davon die Hälfte Download | Monat | monatlich |
+
+Der langsame Teil ist damit das Fahrplan-Parsen, nicht die Statistik: minotor
+braucht pro Wochentag ~9 min, die 213 GB Ist-Daten sind in ~18 min durch.
 
 Die beiden Takte kommen von den Quellen: der GTFS-Feed wird täglich neu gebaut
 und „nächste Gelegenheit jedes Wochentags“ wandert mit dem Datum, während die
