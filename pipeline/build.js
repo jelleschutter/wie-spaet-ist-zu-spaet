@@ -71,6 +71,8 @@ const USAGE = `Build the static data bundle in static/data/.
                     instead of ~15 GB, at the cost of re-downloading on the next
                     run (for CI)
   --node PATH       node executable for the minotor CLI (default: this one)
+  --heap MB         heap cap for the GTFS parse; the default is sized to the
+                    machine, raise it only where there is RAM to back it
   --today DATE      pretend today is this date (YYYY-MM-DD), for reproducible runs
 `;
 
@@ -88,6 +90,7 @@ function parseCli() {
 				force: { type: 'boolean', default: false },
 				prune: { type: 'boolean', default: false },
 				node: { type: 'string', default: process.execPath },
+				heap: { type: 'string' },
 				today: { type: 'string' },
 				help: { type: 'boolean', default: false }
 			},
@@ -130,6 +133,7 @@ function parseCli() {
 		force: values.force,
 		prune: values.prune,
 		node: values.node,
+		heap: integer('heap', values.heap, { min: 512 }),
 		today: values.today ? parseIsoDate(values.today) : todayDate()
 	};
 }
@@ -184,7 +188,9 @@ async function main() {
 		}
 		meta.timetableDates = await timetablesStep.build(GTFS_ZIP, dates, {
 			force: args.force,
-			node: args.node
+			node: args.node,
+			// undefined, not null: that is what lets build() fall back to its own default.
+			heapMb: args.heap ?? undefined
 		});
 	}
 

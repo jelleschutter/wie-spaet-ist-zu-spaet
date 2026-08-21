@@ -21,6 +21,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline';
@@ -51,8 +52,101 @@ const MINOTOR_CLI = path.join(REPO, 'node_modules', 'minotor', 'dist', 'cli.mjs'
 // maps them onto its own RouteTypes enum.
 const GTFS_PROFILE = 'standard';
 
-// Node's default heap isn't enough for a feed this size.
-const NODE_HEAP_MB = 8192;
+// Peak resident memory of one parse-gtfs run over the 2026 feed, measured: the
+// parser holds one route pattern per distinct stop list, with the arrival and
+// departure arrays of every trip on it, and lets go of none of it until the
+// last of the 30 M stop_times rows has been read.
+const PARSE_PEAK_MB = 1400;
+
+// Node's default heap is nowhere near that, so the parse gets its own cap with
+// about three times the headroom it needs - and no more than that.
+//
+// --max-old-space-size is a promise about how much V8 may use before it has to
+// collect in earnest, not a reservation. Set it above what the machine can
+// actually back and V8 does the rational thing: it postpones the major GC it
+// doesn't believe it needs, until the kernel steps in. On Linux that arrives as
+// a bare SIGKILL - no exception, no message, nothing after whatever line the
+// parser last happened to print.
+const NODE_HEAP_MB = 4096;
+
+// So a smaller machine gets a proportionally smaller promise and collects more
+// often instead. The share is of physical memory only: swap keeps the process
+// alive, but sizing the heap to it would just move the thrashing around.
+const HEAP_SHARE = 0.6;
+// ...though never below what the live set actually needs, or V8 spends the whole
+// parse collecting and still fails - just with a clearer message.
+const MIN_HEAP_MB = 1536;
+
+/** The largest heap we can promise V8 here without inviting the OOM killer. */
+export function heapLimitMb() {
+	const affordable = Math.floor((os.totalmem() * HEAP_SHARE) / 1e6);
+	return Math.max(MIN_HEAP_MB, Math.min(NODE_HEAP_MB, affordable));
+}
+
+/**
+ * Why the child stopped, in terms the caller can act on.
+ *
+ * spawnSync reports no exit code at all for anything that isn't an ordinary
+ * exit and puts the reason in `signal` or `error` instead - so a parse the
+ * kernel killed used to be reported here as "exit null", which says nothing
+ * about what to do about it.
+ */
+function whyItStopped(result, heapMb) {
+	if (result.error) return `${result.error.code ?? 'spawn failed'} - ${result.error.message}`;
+	if (result.status === 0) return 'exited cleanly without writing a timetable';
+	if (result.signal === 'SIGKILL') {
+		return (
+			'killed with SIGKILL - nothing inside the parser fails that way, so the kernel ' +
+			`ran the machine out of memory. It had a ${heapMb} MB heap on a ` +
+			`${(os.totalmem() / 1e9).toFixed(1)} GB machine, and the parse needs about ` +
+			`${PARSE_PEAK_MB} MB resident; add swap, use a bigger machine, or build the ` +
+			'timetables elsewhere and copy static/data across'
+		);
+	}
+	if (result.signal) return `killed by ${result.signal}`;
+	return `exit ${result.status}`;
+}
+
+/** The last `count` lines of a file, without reading all of it. */
+function tailOf(file, count) {
+	let size;
+	try {
+		size = fs.statSync(file).size;
+	} catch {
+		return '(no output)';
+	}
+	if (size === 0) return '(no output)';
+	const want = Math.min(size, 64 << 10);
+	const buffer = Buffer.allocUnsafe(want);
+	const fd = fs.openSync(file, 'r');
+	try {
+		fs.readSync(fd, buffer, 0, want, size - want);
+	} finally {
+		fs.closeSync(fd);
+	}
+	return buffer.toString('utf8').trimEnd().split('\n').slice(-count).join('\n');
+}
+
+/** Lines in a file, counted without holding it in memory. */
+function lineCount(file) {
+	let lines = 0;
+	let fd;
+	try {
+		fd = fs.openSync(file, 'r');
+	} catch {
+		return 0;
+	}
+	try {
+		const buffer = Buffer.allocUnsafe(1 << 20);
+		let read;
+		while ((read = fs.readSync(fd, buffer, 0, buffer.length, null)) > 0) {
+			for (let i = 0; i < read; i++) if (buffer[i] === 10) lines++;
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+	return lines;
+}
 
 /** The feed's validity window from feed_info.txt, or null if it declares none. */
 export async function feedWindow(gtfsZip) {
@@ -134,7 +228,11 @@ function gzipTo(source, dest) {
  *
  * @returns {Promise<Record<string, string>>} the date used per day type
  */
-export async function build(gtfsZip, dates, { force = false, node = process.execPath } = {}) {
+export async function build(
+	gtfsZip,
+	dates,
+	{ force = false, node = process.execPath, heapMb = heapLimitMb() } = {}
+) {
 	if (!fs.existsSync(MINOTOR_CLI)) {
 		die(`minotor CLI not found at ${MINOTOR_CLI} - run \`npm install\` first.`);
 	}
@@ -148,6 +246,19 @@ export async function build(gtfsZip, dates, { force = false, node = process.exec
 		if (outside.length) {
 			die(`dates outside the feed's validity window: ${outside.join(', ')}`);
 		}
+	}
+
+	log(`  ${heapMb} MB heap per parse, ${(os.totalmem() / 1e9).toFixed(1)} GB on this machine`);
+	// Twice the peak is what makes a run comfortable; below that the parse and
+	// the system are competing, and no heap size fixes it. Worth saying before
+	// the eight minutes rather than after, because without swap the only symptom
+	// is the process vanishing mid-parse.
+	if (os.totalmem() < 2 * PARSE_PEAK_MB * 1e6) {
+		log(
+			`  warning: one parse peaks at ~${PARSE_PEAK_MB} MB resident, which leaves this ` +
+				`machine little room for anything else. Give it swap, or build the ` +
+				`timetables somewhere larger and copy static/data across.`
+		);
 	}
 
 	ensureDir(WORK_DIR);
@@ -171,6 +282,11 @@ export async function build(gtfsZip, dates, { force = false, node = process.exec
 		const timetableBin = path.join(WORK_DIR, `timetable.${dayType}.bin`);
 		const stopsBin = path.join(WORK_DIR, `stops.${dayType}.bin`);
 		const stampFile = path.join(WORK_DIR, `timetable.${dayType}.stamp`);
+		// minotor's progress goes to stdout and its per-row complaints to stderr;
+		// keeping them apart is what lets a good run say how many rows it skipped
+		// without having to guess which lines were warnings.
+		const logFile = path.join(WORK_DIR, `parse-gtfs.${dayType}.log`);
+		const warnFile = path.join(WORK_DIR, `parse-gtfs.${dayType}.warnings.log`);
 		const want = stampFor(gtfsZip, date);
 		const fresh =
 			!force &&
@@ -184,28 +300,52 @@ export async function build(gtfsZip, dates, { force = false, node = process.exec
 		} else {
 			await timed(`${dayType} (${isoDate(date)})`, async () => {
 				log(`  ${dayType} (${isoDate(date)}): parsing GTFS...`);
-				const result = spawnSync(
-					node,
-					[
-						`--max-old-space-size=${NODE_HEAP_MB}`,
-						MINOTOR_CLI,
-						'parse-gtfs',
-						'--date',
-						isoDate(date),
-						'--profileName',
-						GTFS_PROFILE,
-						'--timetableOutputPath',
-						timetableBin,
-						'--stopsOutputPath',
-						stopsBin,
-						gtfsZip
-					],
-					{ encoding: 'utf8', maxBuffer: 1 << 26 }
-				);
-				if (result.status !== 0) {
-					log((result.stdout ?? '').slice(-2000));
-					log((result.stderr ?? '').slice(-2000));
-					die(`minotor parse-gtfs failed for ${isoDate(date)} (exit ${result.status}).`);
+				// The child's output goes straight to files rather than through a
+				// pipe: the feed is worth tens of thousands of "missing arrival or
+				// departure time" warnings per run, which are normal and which
+				// nobody wants seven times over in a CI log.
+				const logFd = fs.openSync(logFile, 'w');
+				const warnFd = fs.openSync(warnFile, 'w');
+				let result;
+				try {
+					result = spawnSync(
+						node,
+						[
+							`--max-old-space-size=${heapMb}`,
+							MINOTOR_CLI,
+							'parse-gtfs',
+							'--date',
+							isoDate(date),
+							'--profileName',
+							GTFS_PROFILE,
+							'--timetableOutputPath',
+							timetableBin,
+							'--stopsOutputPath',
+							stopsBin,
+							gtfsZip
+						],
+						{ stdio: ['ignore', logFd, warnFd] }
+					);
+				} finally {
+					fs.closeSync(logFd);
+					fs.closeSync(warnFd);
+				}
+				if (result.status !== 0 || !fs.existsSync(timetableBin)) {
+					log(`    last of ${path.relative(REPO, logFile)}:`);
+					log(tailOf(logFile, 8));
+					log(`    last of ${path.relative(REPO, warnFile)}:`);
+					log(tailOf(warnFile, 8));
+					die(`minotor parse-gtfs for ${isoDate(date)}: ${whyItStopped(result, heapMb)}.`);
+				}
+				const warnings = lineCount(warnFile);
+				if (warnings > 0) {
+					// Said out loud because they look alarming and are not: the feed
+					// carries rows the parser can do nothing with, it skips them, and
+					// that is the whole story unless the exit code says otherwise.
+					log(
+						`    skipped ${warnings.toLocaleString('en-US')} rows the feed left ` +
+							`incomplete, listed in ${path.relative(REPO, warnFile)}`
+					);
 				}
 			});
 			fs.writeFileSync(stampFile, want);

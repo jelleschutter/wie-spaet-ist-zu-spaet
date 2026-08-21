@@ -30,9 +30,25 @@ Drei Schritte, jeder einzeln aufrufbar (`--only`) und jeder fortsetzbar:
 
 Nützliche Flags: `--days 3` (nur drei Ist-Daten-Tage, für einen schnellen
 Durchlauf), `--months 1`, `--only delays`, `--force`, `--today 2026-08-17`,
-`--prune` (jedes Monatsarchiv erst kurz vor dem Lesen holen und danach wieder
-löschen — hält den Spitzenplatzbedarf bei einem Monat statt ~16 GB, dafür lädt
-der nächste Lauf erneut herunter; CI baut damit).
+`--heap MB`, `--prune` (jedes Monatsarchiv erst kurz vor dem Lesen holen und
+danach wieder löschen — hält den Spitzenplatzbedarf bei einem Monat statt ~16 GB,
+dafür lädt der nächste Lauf erneut herunter; CI baut damit).
+
+### Wie viel Arbeitsspeicher der Fahrplan braucht
+
+`timetables` ist der einzige speicherhungrige Schritt: minotors `parse-gtfs` hält
+jedes Routenmuster des Feeds gleichzeitig im Speicher und kommt damit auf rund
+**1.4 GB** Spitzenverbrauch pro Lauf. Der Heap-Deckel wird deshalb aus dem RAM der
+Maschine abgeleitet (höchstens 4 GB, `--heap MB` überschreibt ihn) — ein pauschal
+grosser Deckel würde nichts verbessern: V8 räumt erst dann richtig auf, wenn es an
+sein Limit stösst, und auf einer kleinen Maschine kommt der Kernel vorher.
+
+Unter ~3 GB RAM warnt der Build. Ohne Swap beendet der Kernel den Parser dort
+mitten im Lauf mit SIGKILL, und das sieht nach einem Parser-Fehler aus, ist aber
+keiner: Die `Missing arrival or departure time`-Zeilen davor sind normal — das
+Feed enthält ~38 000 Halte ohne Zeiten, die übersprungen werden. Sie stehen
+vollständig in `data/work/parse-gtfs.<wochentag>.warnings.log`, der Fortschritt
+daneben in `parse-gtfs.<wochentag>.log`.
 
 ### Fahrplan: ein Datum pro Wochentag
 
