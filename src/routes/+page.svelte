@@ -103,40 +103,36 @@
 		return platform ? ' · Perron ' + platform : '';
 	}
 
-	function bufferInfo(dto: DepartureDto) {
-		const sec = dto.departure.catchBufferSeconds;
-		if (sec == null) {
-			return {
-				cls: 'neutral',
-				num: '—',
-				label: 'keine Prognose möglich',
-				note: delaysReady
+	/**
+	 * The result hero: how late this departure runs on average, with the buffer
+	 * you actually plan around - how late *you* can be - spelled out below it.
+	 */
+	function heroInfo(dto: DepartureDto) {
+		const avg = dto.departure.delaySeconds;
+		const buffer = dto.departure.catchBufferSeconds;
+		// The colour follows the buffer rather than the average, since that's what
+		// the note answers: whether this departure leaves you any room at all.
+		const cls = buffer == null || buffer === 0 ? 'neutral' : buffer > 0 ? 'good' : 'bad';
+		const note =
+			buffer == null
+				? delaysReady
 					? 'Für diese Verbindung liegen keine Verspätungsdaten vor.'
 					: 'Für diesen Fahrplan liegen keine Verspätungsdaten vor.'
-			};
+				: buffer > 0
+					? `Wenn du ${fmtDuration(buffer)} zu spät kommst, schaffst du es trotzdem in 9 von 10 Fällen.`
+					: buffer < 0
+						? `Diese Verbindung kann früher abfahren — sei ${fmtDuration(-buffer)} vor der planmässigen Zeit da, um sie in 9 von 10 Fällen zu erwischen.`
+						: 'Nur wenn du pünktlich da bist, schaffst du es in 9 von 10 Fällen.';
+		if (avg == null) {
+			return { cls, num: '—', label: 'keine Prognose möglich', note };
 		}
-		if (sec > 0) {
-			return {
-				cls: 'good',
-				num: '+' + fmtDuration(sec),
-				label: 'Verspätung ist drin',
-				note: `Komm bis zu ${fmtDuration(sec)} nach der planmässigen Abfahrt und du schaffst es trotzdem in etwa 9 von 10 Fällen.`
-			};
+		if (avg > 0) {
+			return { cls, num: '+' + fmtDuration(avg), label: 'durchschnittliche Verspätung', note };
 		}
-		if (sec < 0) {
-			return {
-				cls: 'bad',
-				num: '−' + fmtDuration(-sec),
-				label: 'lieber früher da sein',
-				note: `Diese Verbindung kann früher abfahren — sei ${fmtDuration(-sec)} vor der planmässigen Zeit da, um sie in etwa 9 von 10 Fällen zu erwischen.`
-			};
+		if (avg < 0) {
+			return { cls, num: '−' + fmtDuration(-avg), label: 'fährt durchschnittlich zu früh', note };
 		}
-		return {
-			cls: 'neutral',
-			num: '0 Sek',
-			label: 'pünktlich da sein',
-			note: 'Diese Verbindung fährt normalerweise pünktlich ab.'
-		};
+		return { cls, num: '0 Sek', label: 'fährt im Schnitt pünktlich', note };
 	}
 
 	function buildShareUrl(dto: DepartureDto, meta: QueryMeta): URL {
@@ -448,7 +444,7 @@
 	{/if}
 
 	{#if screen === 'result' && result}
-		{@const b = bufferInfo(result)}
+		{@const b = heroInfo(result)}
 		<div class="card">
 			<div class="hero">
 				<div class="hero-num {b.cls}">{b.num}</div>
