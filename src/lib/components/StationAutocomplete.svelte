@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { planner } from '$lib/transit';
+	import { recentStations, type RecentStation } from '$lib/recentStations';
 
 	type Suggestion = {
 		id: number;
@@ -19,10 +20,26 @@
 	let locating = $state(false);
 	let locateError = $state('');
 
+	// Read once: the form is torn down while a result is showing, so a search
+	// made in between is picked up when this comes back.
+	const recents = recentStations();
+
+	/** The recent stations still worth offering for what's been typed so far. */
+	const matchingRecents = $derived(
+		recents.filter((r) => r.name.toLowerCase().includes(value.trim().toLowerCase()))
+	);
+
+	// A station offered as a recent shouldn't show up a second time below it.
+	const matchingSuggestions = $derived(
+		suggestions.filter((s) => !matchingRecents.some((r) => r.id === String(s.id)))
+	);
+
+	const hasItems = $derived(matchingRecents.length > 0 || matchingSuggestions.length > 0);
+
 	async function search(q: string) {
 		if (q.trim().length < 2) {
 			suggestions = [];
-			open = false;
+			open = matchingRecents.length > 0;
 			return;
 		}
 		try {
@@ -30,7 +47,7 @@
 			// A slower earlier lookup must not overwrite a newer query's results.
 			if (q !== value) return;
 			suggestions = results;
-			open = suggestions.length > 0;
+			open = hasItems;
 		} catch {
 			/* stops index still loading or unavailable — leave the dropdown as-is */
 		}
@@ -38,6 +55,8 @@
 
 	function onInput() {
 		stationId = null; // typing invalidates a prior selection
+		// The recents filter on every keystroke; only the stop index lookup waits.
+		open = hasItems;
 		clearTimeout(debounceTimer);
 		debounceTimer = setTimeout(() => search(value), 180);
 	}
@@ -45,6 +64,12 @@
 	function pick(s: Suggestion) {
 		value = s.name;
 		stationId = String(s.id);
+		open = false;
+	}
+
+	function pickRecent(r: RecentStation) {
+		value = r.name;
+		stationId = r.id;
 		open = false;
 	}
 
@@ -123,12 +148,18 @@
 		autocomplete="off"
 		bind:value
 		oninput={onInput}
-		onfocus={() => (open = suggestions.length > 0)}
+		onfocus={() => (open = hasItems)}
 		onblur={() => setTimeout(() => (open = false), 150)}
 	/>
 	{#if open}
 		<div class="ac">
-			{#each suggestions as s (s.id)}
+			{#each matchingRecents as r (r.id)}
+				<button type="button" class="ac-item recent" onmousedown={() => pickRecent(r)}>
+					<span class="ac-name">{r.name}</span>
+					<span class="ac-meta">Zuletzt gesucht</span>
+				</button>
+			{/each}
+			{#each matchingSuggestions as s (s.id)}
 				<button type="button" class="ac-item" onmousedown={() => pick(s)}>
 					<span class="ac-name">{s.name}</span>
 					<span class="ac-meta">{meta(s)}</span>

@@ -219,6 +219,10 @@ button.secondary:hover {
 .ac-name {
 	font-weight: 500;
 }
+/* Previously searched stations, offered above the stop-index hits. */
+.ac-item.recent .ac-meta {
+	color: var(--accent);
+}
 .ac-meta {
 	color: var(--muted);
 	font-size: 12.5px;

@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { replaceState } from '$app/navigation';
 	import StationAutocomplete from '$lib/components/StationAutocomplete.svelte';
+	import { rememberStation } from '$lib/recentStations';
 	import {
 		dayTypeOf,
 		holidayName,
@@ -178,6 +179,9 @@
 				return;
 			}
 			statusMsg = '';
+			// The stop the query resolved to, not what was typed: recents are then
+			// offered back under the canonical name and re-search by id.
+			rememberStation({ id: String(data.query.from.id), name: data.query.from.name });
 			resultDayType = data.dayType;
 			const preselected = pick
 				? data.results.find(
