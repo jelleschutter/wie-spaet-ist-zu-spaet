@@ -119,7 +119,7 @@
 					? 'Für diese Verbindung liegen keine Verspätungsdaten vor.'
 					: 'Für diesen Fahrplan liegen keine Verspätungsdaten vor.'
 				: buffer > 0
-					? `Wenn du ${fmtDuration(buffer)} zu spät kommst, schaffst du es trotzdem in 9 von 10 Fällen.`
+					? `Wenn du ${fmtDuration(buffer)} zu spät kommst, schaffst du es in 9 von 10 Fällen.`
 					: buffer < 0
 						? `Diese Verbindung kann früher abfahren — sei ${fmtDuration(-buffer)} vor der planmässigen Zeit da, um sie in 9 von 10 Fällen zu erwischen.`
 						: 'Nur wenn du pünktlich da bist, schaffst du es in 9 von 10 Fällen.';
