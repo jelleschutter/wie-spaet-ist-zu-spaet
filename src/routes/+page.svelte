@@ -494,8 +494,9 @@
 	<footer>
 		Erstellt von
 		<a href="https://jelle.schutter.xyz" target="_blank" rel="noopener noreferrer">Jelle Schutter</a>
-		&nbsp;·&nbsp;
-		Daten von <a href="https://opentransportdata.swiss" target="_blank" rel="noopener noreferrer">Open Transport Data</a>
+		mit Daten von
+		<a href="https://opentransportdata.swiss" target="_blank" rel="noopener noreferrer">opentransportdata.swiss</a>
+		❤️
 	</footer>
 </main>
 
