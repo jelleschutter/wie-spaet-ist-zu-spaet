@@ -274,6 +274,19 @@
 		if (window) showPage('around', window.earliest, AROUND_SIZE);
 	}
 
+	/**
+	 * Whether a listed departure is the one the result screen is showing, so a
+	 * page of alternatives points out where you currently are in it.
+	 */
+	function isCurrent(dto: DepartureDto) {
+		return (
+			result != null &&
+			dto.plannedDepartureMinutes === result.plannedDepartureMinutes &&
+			dto.line === result.line &&
+			(dto.destination?.id ?? null) === (result.destination?.id ?? null)
+		);
+	}
+
 	function pick(dto: DepartureDto, paged: boolean) {
 		const meta = queryMeta as QueryMeta;
 		// A departure picked off a page is no longer the one the original query
@@ -401,7 +414,14 @@
 	{#snippet departureList(items: DepartureDto[], paged: boolean)}
 		<div class="select-list">
 			{#each items as r (r.plannedDepartureMinutes + ':' + r.line + ':' + (r.destination?.id ?? ''))}
-				<button type="button" class="select-item" onclick={() => pick(r, paged)}>
+				{@const current = isCurrent(r)}
+				<button
+					type="button"
+					class="select-item"
+					class:current
+					aria-current={current ? 'true' : undefined}
+					onclick={() => pick(r, paged)}
+				>
 					{#if paged}
 						<span class="select-time">{r.plannedDeparture}</span>
 					{/if}

@@ -258,6 +258,15 @@ button.secondary:hover {
 .select-item:hover {
 	border-color: var(--accent);
 }
+/* The departure the result screen is showing, marked where it sits in a page
+   of alternatives so you can tell which way you're stepping from. */
+.select-item.current {
+	border-color: var(--accent);
+	background: color-mix(in srgb, var(--accent) 14%, var(--bg));
+}
+.select-item.current .select-meta {
+	color: color-mix(in srgb, var(--accent) 55%, var(--text));
+}
 .select-time {
 	flex: 0 0 auto;
 	min-width: 42px;
