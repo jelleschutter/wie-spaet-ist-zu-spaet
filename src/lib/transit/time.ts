@@ -58,6 +58,20 @@ export function secondsToClock(totalSeconds: number): string {
 	return `${pad2(h)}:${pad2(m)}:${pad2(sec)}`;
 }
 
+export function isoDate(date: Date): string {
+	return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+export function parseIsoDate(iso: string): Date {
+	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso ?? '');
+	if (!match) return new Date();
+	return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+export function addDays(date: Date, days: number): Date {
+	return new Date(date.getFullYear(), date.getMonth(), date.getDate() + days);
+}
+
 /**
  * The day type of a Date: its weekday, except that Swiss nationwide holidays
  * run the Sunday timetable and are bucketed as Sunday - exactly how the

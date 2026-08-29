@@ -15,6 +15,6 @@ export type {
 	StaticMeta,
 	StopDto
 } from './planner';
-export { dayTypeOf } from './time';
+export { addDays, dayTypeOf, isoDate, parseIsoDate } from './time';
 export type { DayType } from './time';
 export { holidayName, isHoliday } from './holidays';

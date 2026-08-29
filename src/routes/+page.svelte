@@ -4,8 +4,12 @@
 	import StationAutocomplete from '$lib/components/StationAutocomplete.svelte';
 	import { rememberStation } from '$lib/recentStations';
 	import {
+		addDays,
 		dayTypeOf,
 		holidayName,
+		isHoliday,
+		isoDate,
+		parseIsoDate,
 		planner,
 		TransitError,
 		type DayType,
@@ -23,7 +27,7 @@
 		sunday: 'Sonntag'
 	};
 
-	type QueryMeta = { stationId: string; stationName: string; time: string; dayType: DayType };
+	type QueryMeta = { stationId: string; stationName: string; time: string; date: string };
 
 	const TAGLINE = 'Finde heraus, wie viel Verspätung du dir leisten kannst.';
 
@@ -33,15 +37,23 @@
 	/** How many either side of the current departure "Alternative Verbindungen" opens with. */
 	const AROUND_SIZE = 2;
 
-	// Nationwide holidays run the Sunday timetable, so the day type defaults to
-	// Sonntag on one - worth saying out loud rather than looking like a bug.
-	const todaysHoliday = holidayName(new Date());
+	const DATE_WINDOW_DAYS = 14;
+
+	const DATE_FORMAT = new Intl.DateTimeFormat('de-CH', {
+		weekday: 'long',
+		day: '2-digit',
+		month: '2-digit'
+	});
+
+	const DAY_MONTH_FORMAT = new Intl.DateTimeFormat('de-CH', { day: '2-digit', month: '2-digit' });
 
 	let screen = $state<'form' | 'select' | 'result' | 'list'>('form');
 	let stationName = $state('');
 	let stationId = $state<string | null>(null);
 	let time = $state('');
-	let dayType = $state<DayType>(dayTypeOf(new Date()));
+	let date = $state(isoDate(new Date()));
+	let minDate = $state(isoDate(new Date()));
+	let maxDate = $state(isoDate(addDays(new Date(), DATE_WINDOW_DAYS)));
 	let serviceDays = $state<DayType[]>([dayTypeOf(new Date())]);
 	let delaysReady = $state(false);
 	let delayInfo = $state(TAGLINE);
@@ -61,8 +73,42 @@
 	let toastMsg = $state('');
 	let toastVisible = $state(false);
 
+	const dayType = $derived(dayTypeOf(parseIsoDate(date)));
+	const selectedHoliday = $derived(holidayName(parseIsoDate(date)));
+	const dayUnavailable = $derived(!serviceDays.includes(dayType));
+
 	function pad2(n: number) {
 		return String(n).padStart(2, '0');
+	}
+
+	function formatDate(iso: string) {
+		const day = parseIsoDate(iso);
+		if (day.getDay() !== 0 && isHoliday(day)) return `Feiertag, ${DAY_MONTH_FORMAT.format(day)}`;
+		return DATE_FORMAT.format(day);
+	}
+
+	function dayTypeOfMeta(meta: QueryMeta): DayType {
+		return dayTypeOf(parseIsoDate(meta.date));
+	}
+
+	function nextDateOf(wanted: DayType): string {
+		const today = new Date();
+		for (let i = 0; i < 7; i++) {
+			const candidate = addDays(today, i);
+			if (dayTypeOf(candidate) === wanted) return isoDate(candidate);
+		}
+		return isoDate(today);
+	}
+
+	function linkDate(shared: string | null, sharedDayType: string | null): string {
+		if (shared && /^\d{4}-\d{2}-\d{2}$/.test(shared)) {
+			if (shared >= minDate && shared <= maxDate) return shared;
+			return nextDateOf(dayTypeOf(parseIsoDate(shared)));
+		}
+		if (sharedDayType && serviceDays.includes(sharedDayType as DayType)) {
+			return nextDateOf(sharedDayType as DayType);
+		}
+		return date;
 	}
 
 	function updateTimeToNow() {
@@ -70,10 +116,16 @@
 		time = pad2(now.getHours()) + ':' + pad2(now.getMinutes());
 	}
 
+	function refreshDateWindow() {
+		minDate = isoDate(new Date());
+		maxDate = isoDate(addDays(new Date(), DATE_WINDOW_DAYS));
+		if (date < minDate || date > maxDate) date = minDate;
+	}
+
 	function resetDefaults() {
 		updateTimeToNow();
-		const today = dayTypeOf(new Date());
-		dayType = serviceDays.includes(today) ? today : (serviceDays[0] ?? today);
+		date = isoDate(new Date());
+		refreshDateWindow();
 	}
 
 	function fmtDuration(abs: number) {
@@ -141,7 +193,7 @@
 		params.set('station', meta.stationId);
 		params.set('stationName', meta.stationName);
 		params.set('time', meta.time);
-		params.set('dayType', meta.dayType);
+		params.set('date', meta.date);
 		params.set('line', dto.line);
 		if (dto.destination?.id != null) params.set('dest', String(dto.destination.id));
 		// The deep link lives in the fragment, which never reaches the server: every
@@ -163,18 +215,19 @@
 
 	async function runSearch(meta: QueryMeta, pick?: { line: string; dest: string | null }) {
 		busy = true;
+		const metaDayType = dayTypeOfMeta(meta);
 		// The first lookup of a day type pulls in its timetable (a few MB), which
 		// takes noticeably longer than the search itself — say so.
-		statusMsg = planner.isReady(meta.dayType) ? 'Suche läuft …' : 'Fahrplandaten werden geladen …';
+		statusMsg = planner.isReady(metaDayType) ? 'Suche läuft …' : 'Fahrplandaten werden geladen …';
 		statusError = false;
 		try {
 			const data = await planner.getDepartures({
 				from: meta.stationId,
 				time: meta.time,
-				dayType: meta.dayType
+				dayType: metaDayType
 			});
 			if (!data.results.length) {
-				statusMsg = `Keine weiteren Abfahrten ab ${meta.stationName || meta.stationId} nach ${meta.time} Uhr an diesem Tag.`;
+				statusMsg = `Keine weiteren Abfahrten ab ${meta.stationName || meta.stationId} nach ${meta.time} Uhr am ${formatDate(meta.date)}`;
 				statusError = true;
 				return;
 			}
@@ -233,7 +286,7 @@
 			const data = await planner.getDepartureList({
 				from: queryMeta.stationId,
 				at,
-				dayType: queryMeta.dayType,
+				dayType: dayTypeOfMeta(queryMeta),
 				direction,
 				limit
 			});
@@ -298,6 +351,16 @@
 		showResult(dto, paged ? { ...meta, time: dto.plannedDeparture } : meta, resultDayType);
 	}
 
+	function openPicker(e: MouseEvent) {
+		const input = e.currentTarget as HTMLInputElement;
+		if (typeof input.showPicker !== 'function') return;
+		try {
+			input.showPicker();
+		} catch {
+			/* schon offen */
+		}
+	}
+
 	function submit(e: SubmitEvent) {
 		e.preventDefault();
 		const id = stationId ?? stationName.trim();
@@ -306,7 +369,17 @@
 			statusError = true;
 			return;
 		}
-		runSearch({ stationId: id, stationName, time, dayType });
+		if (date < minDate || date > maxDate) {
+			statusMsg = `Bitte wähle ein Datum zwischen dem ${formatDate(minDate)} und dem ${formatDate(maxDate)}`;
+			statusError = true;
+			return;
+		}
+		if (dayUnavailable) {
+			statusMsg = `Für ${DAY_TYPE_LABELS[dayType]} liegen keine Fahrplandaten vor.`;
+			statusError = true;
+			return;
+		}
+		runSearch({ stationId: id, stationName, time, date });
 	}
 
 	function goAgain() {
@@ -318,9 +391,10 @@
 		listLatest = null;
 		queryMeta = null;
 		statusMsg = '';
-		// Keep the station and day type as they were; only the time needs to
+		// Keep the station and the date as they were; only the time needs to
 		// move forward so "Nochmal" reflects the moment you're clicking it.
 		updateTimeToNow();
+		refreshDateWindow();
 		screen = 'form';
 	}
 
@@ -367,12 +441,12 @@
 				stationId: sId,
 				stationName: params.get('stationName') || sId,
 				time: params.get('time') || time,
-				dayType: (params.get('dayType') as DayType) || dayType
+				date: linkDate(params.get('date'), params.get('dayType'))
 			};
 			stationId = meta.stationId;
 			stationName = meta.stationName;
 			time = meta.time;
-			if (serviceDays.includes(meta.dayType)) dayType = meta.dayType;
+			date = meta.date;
 			const line = params.get('line');
 			runSearch(meta, line ? { line, dest: params.get('dest') } : undefined);
 		})();
@@ -401,14 +475,19 @@
 				<input type="time" id="time" bind:value={time} />
 			</div>
 			<div class="field">
-				<label for="dayType">Wochentag</label>
-				<select id="dayType" bind:value={dayType}>
-					{#each serviceDays as t (t)}
-						<option value={t}>{DAY_TYPE_LABELS[t]}</option>
-					{/each}
-				</select>
-				{#if todaysHoliday}
-					<p class="sub">Heute ist {todaysHoliday} — es gilt der Sonntagsfahrplan.</p>
+				<label for="date">Datum</label>
+				<input
+					type="date"
+					id="date"
+					bind:value={date}
+					min={minDate}
+					max={maxDate}
+					onclick={openPicker}
+				/>
+				{#if selectedHoliday}
+					<p class="sub">{selectedHoliday} — es gilt der Sonntagsfahrplan.</p>
+				{:else if dayUnavailable}
+					<p class="sub">Für {DAY_TYPE_LABELS[dayType]} liegen keine Fahrplandaten vor.</p>
 				{/if}
 			</div>
 			<button class="go" type="submit" disabled={busy}>Berechnen</button>
@@ -459,7 +538,9 @@
 			<h2>Verbindungen ab {queryMeta?.stationName || 'der Haltestelle'}</h2>
 			<p class="sub">
 				{listResults[0].plannedDeparture} – {listResults[listResults.length - 1]
-					.plannedDeparture} Uhr{#if resultDayType}, {DAY_TYPE_LABELS[resultDayType]}{/if}
+					.plannedDeparture} Uhr{#if queryMeta}, {formatDate(queryMeta.date)}{:else if resultDayType}, {DAY_TYPE_LABELS[
+						resultDayType
+					]}{/if}
 			</p>
 			<button class="pager" type="button" onclick={goEarlier} disabled={busy}>↑ Früher</button>
 			{@render departureList(listResults, true)}
@@ -481,7 +562,9 @@
 					<span class="detail-dest">{result.plannedDeparture} → {result.destination?.name ?? '?'}</span>
 					<span class="detail-meta">
 						{prettyMode(result.mode)}{platformLabel(result.from.platform)}
-						{#if resultDayType}
+						{#if queryMeta}
+							· {formatDate(queryMeta.date)}
+						{:else if resultDayType}
 							· {DAY_TYPE_LABELS[resultDayType]}
 						{/if}
 					</span>
