@@ -4,6 +4,18 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="text-scale" content="scale" />
+		<script>
+			// Start the two day-independent data files while the document is still
+			// parsing, instead of waiting for the app bundle to download, execute and
+			// mount. src/lib/transit/assets.ts takes these responses over rather than
+			// fetching them a second time.
+			window.__transitPreload = new Map(
+				['meta.json', 'stops.bin.gz'].map((path) => [
+					path,
+					fetch(new URL('data/' + path, new URL('.', location))).catch(() => null)
+				])
+			);
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

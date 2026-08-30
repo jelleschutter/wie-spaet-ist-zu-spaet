@@ -137,10 +137,19 @@ src/lib/transit/          die Logik, die früher auf dem Server lief
   holidays.ts / time.ts   Feiertage und Zeit-Helfer
 ```
 
-Was der Browser lädt: `meta.json` (~20 KB) plus den Haltestellen-Index (1.4 MB)
-beim ersten Tippen, einen Fahrplan (5–8 MB) bei der ersten Abfrage eines
-Wochentags, danach ~20 KB pro Haltestelle. Alles bleibt für die Session im
-Speicher; eine zweite Abfrage am selben Wochentag dauert ~10 ms.
+Was der Browser lädt: `meta.json` (~20 KB) plus den Haltestellen-Index (1.4 MB),
+einen Fahrplan (5–8 MB) pro Wochentag, danach ~20 KB pro Haltestelle. Alles
+bleibt für die Session im Speicher; eine zweite Abfrage am selben Wochentag
+dauert ~10 ms.
+
+Geladen wird vorab, nicht auf Zuruf: das Inline-Skript in `app.html` startet
+`meta.json` und den Haltestellen-Index, während das Dokument noch geparst wird
+— also bevor das App-Bundle überhaupt da ist —, und `TransitPlanner.preload()`
+hängt den Fahrplan des im Formular gewählten Tages hinten dran, während die
+Eingaben noch gemacht werden. Der Reihe nach, nicht gleichzeitig: die
+Haltestellensuche kommt zuerst und soll sich die Leitung nicht mit ein paar MB
+Fahrplan teilen. Bei einer Abfrage in den frühen Morgenstunden kommt der
+Vortag dazu (Nachtkurse), bei gesetztem Data-Saver gar nichts.
 
 Ein Durchlauf über 12 Monate ergibt 26.6 Mio. Kurse (3.2–4.2 Mio. pro
 Wochentag) an 24 755 Haltestellen. Der Median liegt bei 20–32 Messungen pro

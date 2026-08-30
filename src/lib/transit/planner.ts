@@ -42,9 +42,11 @@ const ROUTE_TYPE_LABELS: Record<number, string> = {
 // RAPTOR A-to-B route, so there's no Router/Query here, just the Timetable's
 // per-stop route index.
 //
-// Everything loads lazily and is then cached for the session: the stops index
-// (~2.3 MB) on the first station search, a day type's timetable (~3-5 MB) on
-// the first lookup for that day, and one ~15 KB delay shard per station.
+// Everything is cached for the session, and the two big files are fetched
+// before they are asked for rather than on demand: app.html starts the stops
+// index (~1.5 MB) while the document is still parsing, and `preload` follows it
+// with the timetable of the day in the form (~5-8 MB) while it is still being
+// filled in. Only the ~20 KB delay shard is left to the lookup itself.
 // ---------------------------------------------------------------------------
 
 /** An error with a message meant to be shown to the user as-is. */
@@ -169,10 +171,15 @@ export const PREVIOUS_DAY_TAIL_CUTOFF = 6 * 60;
 export class TransitPlanner {
 	private metaPromise?: Promise<StaticMeta>;
 	private stopsPromise?: Promise<StopsIndex>;
+	/** The stops index' *download*, which finishes a second before the index does. */
+	private stopsFetched?: Promise<unknown>;
 	private timetablePromises = new Map<DayType, Promise<Timetable>>();
 	private delaysPromise?: Promise<DelayIndex>;
 	private stopsLoaded = false;
 	private timetablesLoaded = new Set<DayType>();
+	/** Day types queued for a background preload, in the order they are wanted. */
+	private warmWanted: DayType[] = [];
+	private warmRunning = false;
 
 	/** Whether a lookup for this day type can be answered without more downloads. */
 	isReady(dayType: DayType): boolean {
@@ -192,13 +199,22 @@ export class TransitPlanner {
 
 	private stops(): Promise<StopsIndex> {
 		if (!this.stopsPromise) {
-			const promise = (this.stopsPromise = fetchBinary('stops.bin.gz').then((data) => {
+			const bytes = (this.stopsFetched = fetchBinary('stops.bin.gz'));
+			const promise = (this.stopsPromise = (async () => {
+				const data = await bytes;
+				// Building the index blocks the main thread for about a second. Yield
+				// the turn first, so a preload waiting on the same download gets its
+				// request out onto the now-idle connection before that happens.
+				await new Promise((resolve) => setTimeout(resolve, 0));
 				const index = StopsIndex.fromData(data as Uint8Array);
 				this.stopsLoaded = true;
 				return index;
-			}));
+			})());
 			promise.catch(() => {
-				if (this.stopsPromise === promise) this.stopsPromise = undefined;
+				if (this.stopsPromise === promise) {
+					this.stopsPromise = undefined;
+					this.stopsFetched = undefined;
+				}
 			});
 		}
 		return this.stopsPromise;
@@ -234,6 +250,50 @@ export class TransitPlanner {
 	prewarm(): void {
 		void this.meta().catch(() => {});
 		void this.stops().catch(() => {});
+	}
+
+	/**
+	 * Warms the timetables a lookup on these days would need, so the lookup
+	 * itself doesn't have to download a few MB first. The list replaces whatever
+	 * was queued and not yet started: paging through dates should end up with
+	 * the day that is actually selected, not one timetable per date touched on
+	 * the way there.
+	 */
+	preload(...dayTypes: (DayType | null | undefined)[]): void {
+		// A timetable is several MB the visitor may never ask for, so an explicit
+		// data-saver setting means waiting until they do.
+		if ((navigator as { connection?: { saveData?: boolean } }).connection?.saveData) return;
+		this.warmWanted = dayTypes.filter(
+			(d): d is DayType => d != null && !this.timetablePromises.has(d)
+		);
+		if (!this.warmRunning) void this.warmPump();
+	}
+
+	/**
+	 * Drains the preload queue one file at a time, behind the stops download:
+	 * the station search is the interaction that comes first, and everything
+	 * here competes with it - and with the next entry - for the same bandwidth.
+	 */
+	private async warmPump(): Promise<void> {
+		this.warmRunning = true;
+		try {
+			const meta = await this.meta().catch(() => null);
+			// Only the stops *download* is in the way. Turning those bytes into an
+			// index is a second of main-thread work with the connection sitting
+			// idle - which the next file can spend downloading instead.
+			void this.stops().catch(() => {});
+			await this.stopsFetched?.catch(() => {});
+			for (;;) {
+				const dayType = this.warmWanted.shift();
+				if (!dayType) return;
+				// A day the bundle doesn't carry has no file to fetch.
+				if (meta && !meta.serviceDays.includes(dayType)) continue;
+				if (this.timetablePromises.has(dayType)) continue;
+				await this.timetable(dayType).catch(() => {});
+			}
+		} finally {
+			this.warmRunning = false;
+		}
 	}
 
 	/** The day type whose timetable is actually used for a requested one. */

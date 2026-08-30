@@ -102,6 +102,12 @@
 		return dayTypeOf(addDays(parseIsoDate(meta.date), -1));
 	}
 
+	/** Whether a lookup at this time still reaches the previous day's night services. */
+	function needsPreviousDay(time: string): boolean {
+		const [h, m] = time.split(':').map(Number);
+		return Number.isFinite(h) && Number.isFinite(m) && h * 60 + m < PREVIOUS_DAY_TAIL_CUTOFF;
+	}
+
 	function nextDateOf(wanted: DayType): string {
 		const today = new Date();
 		for (let i = 0; i < 7; i++) {
@@ -228,14 +234,12 @@
 		busy = true;
 		listDate = null;
 		const metaDayType = dayTypeOfMeta(meta);
-		const [h, m] = meta.time.split(':').map(Number);
-		const needsPreviousDay = h * 60 + m < PREVIOUS_DAY_TAIL_CUTOFF;
 		// The first lookup of a day type pulls in its timetable (a few MB), which
 		// takes noticeably longer than the search itself — say so. In the small
 		// hours that is two timetables, and either one can be the slow part.
 		const ready =
 			planner.isReady(metaDayType) &&
-			(!needsPreviousDay || planner.isReady(previousDayTypeOfMeta(meta)));
+			(!needsPreviousDay(meta.time) || planner.isReady(previousDayTypeOfMeta(meta)));
 		statusMsg = ready ? 'Suche läuft …' : 'Fahrplandaten werden geladen …';
 		statusError = false;
 		try {
@@ -488,6 +492,15 @@
 		toastVisible = true;
 		setTimeout(() => (toastVisible = false), 1800);
 	}
+
+	// The timetable of the day in the form, pulled in while it is still being
+	// filled in: the download is the slow part of a lookup, so by the time a
+	// station and a time are picked it has usually already arrived. Re-runs on
+	// every date change, and the planner drops what a new pick supersedes.
+	$effect(() => {
+		const day = parseIsoDate(date);
+		planner.preload(dayTypeOf(day), needsPreviousDay(time) ? dayTypeOf(addDays(day, -1)) : null);
+	});
 
 	onMount(() => {
 		(async () => {

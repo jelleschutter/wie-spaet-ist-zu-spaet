@@ -16,6 +16,24 @@ export function dataUrl(path: string): string {
 	return `${base}/data/${path}`;
 }
 
+/**
+ * The response the inline script in app.html already started for this file
+ * while the document was parsing, if there is one. A body can only be read
+ * once, so it is handed over exactly once and anything after that - a retry
+ * included - goes back to the network.
+ */
+function handover(path: string): Promise<Response | null> | undefined {
+	const started = (globalThis as { __transitPreload?: Map<string, Promise<Response | null>> })
+		.__transitPreload;
+	const pending = started?.get(path);
+	started?.delete(path);
+	return pending;
+}
+
+async function request(path: string): Promise<Response> {
+	return (await handover(path)) ?? (await fetch(dataUrl(path)));
+}
+
 function isGzip(data: Uint8Array): boolean {
 	return data.length > 2 && data[0] === 0x1f && data[1] === 0x8b;
 }
@@ -37,8 +55,7 @@ export async function fetchBinary(
 	path: string,
 	options: { optional?: boolean } = {}
 ): Promise<Uint8Array | null> {
-	const url = dataUrl(path);
-	const res = await fetch(url);
+	const res = await request(path);
 	if (!res.ok) {
 		if (options.optional && res.status === 404) return null;
 		throw new Error(`Daten konnten nicht geladen werden (${path}: HTTP ${res.status}).`);
@@ -49,7 +66,7 @@ export async function fetchBinary(
 
 /** Fetches a JSON file from the data bundle. */
 export async function fetchJson<T>(path: string): Promise<T> {
-	const res = await fetch(dataUrl(path));
+	const res = await request(path);
 	if (!res.ok) throw new Error(`Daten konnten nicht geladen werden (${path}: HTTP ${res.status}).`);
 	return res.json() as Promise<T>;
 }
