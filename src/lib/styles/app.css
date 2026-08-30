@@ -382,7 +382,7 @@ button.secondary:hover {
 .hero-label {
 	color: var(--muted);
 	font-size: 14px;
-	margin-top: 4px;
+	margin-bottom: 6px;
 }
 .hero-note {
 	color: var(--muted);

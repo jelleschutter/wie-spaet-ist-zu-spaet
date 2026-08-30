@@ -169,8 +169,11 @@
 		return map[mode] ?? mode ?? '';
 	}
 
-	function platformLabel(platform: string | null) {
-		return platform ? ' · Perron ' + platform : '';
+	/** The modes that run on rails, and so stop at a Gleis rather than a Kante. */
+	const TRACK_MODES = new Set(['RAIL', 'SUBWAY', 'FUNICULAR']);
+
+	function platformLabel(mode: string, platform: string | null) {
+		return platform ? ` · ${TRACK_MODES.has(mode) ? 'Gleis' : 'Kante'} ${platform}` : '';
 	}
 
 	/**
@@ -189,20 +192,24 @@
 					? 'Für diese Verbindung liegen keine Verspätungsdaten vor.'
 					: 'Für diesen Fahrplan liegen keine Verspätungsdaten vor.'
 				: buffer > 0
-					? `Wenn du ${fmtDuration(buffer)} zu spät kommst, schaffst du es in 9 von 10 Fällen.`
+					? `Wenn du auf der sicheren Seite sein möchtest, komm weniger als ${fmtDuration(buffer)} zu spät, dann schaffst du es in 9 von 10 Fällen.`
 					: buffer < 0
-						? `Diese Verbindung kann früher abfahren — sei ${fmtDuration(-buffer)} vor der planmässigen Zeit da, um sie in 9 von 10 Fällen zu erwischen.`
-						: 'Nur wenn du pünktlich da bist, schaffst du es in 9 von 10 Fällen.';
+						? `Wenn du auf der sicheren Seite sein möchtest, sei ${fmtDuration(-buffer)} vor der planmässigen Zeit da, dann schaffst du es in 9 von 10 Fällen.`
+						: 'Wenn du auf der sicheren Seite sein möchtest, sei pünktlich da, dann schaffst du es in 9 von 10 Fällen.';
 		if (avg == null) {
-			return { cls, num: '—', label: 'keine Prognose möglich', note };
+			return { cls, num: '—', label: 'Keine Prognose möglich', note };
 		}
-		if (avg > 0) {
-			return { cls, num: '+' + fmtDuration(avg), label: 'durchschnittliche Verspätung', note };
-		}
+		// The label above the number says which way it goes, so the number itself
+		// carries no sign - and "0 Sek" reads as a Verspätung like any other.
 		if (avg < 0) {
-			return { cls, num: '−' + fmtDuration(-avg), label: 'fährt durchschnittlich zu früh', note };
+			return {
+				cls,
+				num: fmtDuration(-avg),
+				label: 'Diese Verbindung fährt durchschnittlich zu früh:',
+				note
+			};
 		}
-		return { cls, num: '0 Sek', label: 'fährt im Schnitt pünktlich', note };
+		return { cls, num: fmtDuration(avg), label: 'Die durchschnittliche Verspätung beträgt:', note };
 	}
 
 	function buildShareUrl(dto: DepartureDto, meta: QueryMeta): URL {
@@ -594,7 +601,7 @@
 					<span class="badge mode-{r.mode || 'OTHER'}">{r.line}</span>
 					<span class="select-body">
 						<span class="select-dest">→ {r.destination?.name ?? '?'}</span>
-						<span class="select-meta">{prettyMode(r.mode)}{platformLabel(r.from.platform)}</span>
+						<span class="select-meta">{prettyMode(r.mode)}{platformLabel(r.mode, r.from.platform)}</span>
 					</span>
 				</button>
 			{/each}
@@ -635,8 +642,8 @@
 		{@const b = heroInfo(result)}
 		<div class="card">
 			<div class="hero">
-				<div class="hero-num {b.cls}">{b.num}</div>
 				<div class="hero-label">{b.label}</div>
+				<div class="hero-num {b.cls}">{b.num}</div>
 				<div class="hero-note">{b.note}</div>
 			</div>
 			<div class="detail">
@@ -644,7 +651,7 @@
 				<span class="detail-body">
 					<span class="detail-dest">{result.plannedDeparture} → {result.destination?.name ?? '?'}</span>
 					<span class="detail-meta">
-						{prettyMode(result.mode)}{platformLabel(result.from.platform)}
+						{prettyMode(result.mode)}{platformLabel(result.mode, result.from.platform)}
 						{#if queryMeta}
 							· {formatDate(queryMeta.date)}
 						{:else if resultDayType}
