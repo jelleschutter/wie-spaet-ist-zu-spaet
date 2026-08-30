@@ -123,10 +123,27 @@ export type DepartureListResult = {
 	results: DepartureDto[];
 };
 
+/**
+ * One service day's contribution to a board. A trip belongs to the day it
+ * *started*, so the ones leaving a stop just after midnight sit in the previous
+ * day's timetable at 24:00 and beyond; `offset` (1440 for that day, 0 for the
+ * current one) converts them to the clock of the day being asked about.
+ */
+type Segment = {
+	dayType: DayType;
+	timetable: Timetable;
+	stationDelays: StationDelays | null;
+	offset: number;
+};
+
 type Candidate = {
 	route: TimetableRoute;
 	boardStopId: number;
+	/** Minutes from midnight of the day asked about, so both segments sort as one. */
 	departureTime: number;
+	/** The same departure in its own service day's minutes, which the delays are keyed by. */
+	serviceTime: number;
+	segment: Segment;
 	serviceInfo: RouteServiceInfo;
 };
 
@@ -135,8 +152,7 @@ type Board = {
 	stopsIndex: StopsIndex;
 	origin: Stop;
 	serviceDayType: DayType;
-	timetable: Timetable;
-	stationDelays: StationDelays | null;
+	segments: Segment[];
 	boardStopIds: Set<number>;
 	delayMeta: {
 		delaysAvailable: boolean;
@@ -145,6 +161,10 @@ type Board = {
 		availableDayTypes: DayType[];
 	};
 };
+
+/** Night services run to about 03:45, so a lookup above this hour has nothing to
+ *  gain from the previous day's timetable and shouldn't fetch its few MB. */
+export const PREVIOUS_DAY_TAIL_CUTOFF = 6 * 60;
 
 export class TransitPlanner {
 	private metaPromise?: Promise<StaticMeta>;
@@ -287,15 +307,17 @@ export class TransitPlanner {
 	async getDepartures({
 		from,
 		time = '08:00',
-		dayType
+		dayType,
+		previousDayType
 	}: {
 		from: string | null;
 		time?: string;
 		dayType?: string | null;
+		previousDayType?: string | null;
 	}): Promise<DeparturesResult> {
 		if (!from) throw new TransitError('Bitte gib einen Abfahrtsort ein.');
 		const afterMinutes = parseTime(time);
-		const board = await this.board(from, dayType);
+		const board = await this.board(from, dayType, previousDayType, afterMinutes);
 
 		// One page of one minute: the earliest departure at or after the time,
 		// and everything tied with it.
@@ -327,23 +349,32 @@ export class TransitPlanner {
 		from,
 		at,
 		dayType,
+		previousDayType,
 		direction = 'later',
 		limit = 5
 	}: {
 		from: string | null;
 		at: string | number;
 		dayType?: string | null;
+		previousDayType?: string | null;
 		direction?: Direction;
 		limit?: number;
 	}): Promise<DepartureListResult> {
 		if (!from) throw new TransitError('Bitte gib einen Abfahrtsort ein.');
 		const atMinutes = typeof at === 'number' ? at : parseTime(at);
-		const board = await this.board(from, dayType);
+		let board = await this.board(from, dayType, previousDayType, atMinutes);
+		let page = buildPage(board, direction, atMinutes, limit);
 
-		const page =
-			direction === 'around'
-				? around(board, atMinutes, limit)
-				: pageOf(collect(board, direction, atMinutes, limit), direction, limit);
+		// An `earlier` page walks backwards past its anchor, so it can reach the
+		// hours the previous service day covers even when the anchor itself sat
+		// above the cutoff. Only then is that timetable worth fetching.
+		if (direction === 'earlier' && board.segments.length === 1) {
+			const reached = page.length ? Math.min(...page.map((c) => c.departureTime)) : 0;
+			if (reached < PREVIOUS_DAY_TAIL_CUTOFF) {
+				board = await this.board(from, dayType, previousDayType, atMinutes, true);
+				page = buildPage(board, direction, atMinutes, limit);
+			}
+		}
 		const times = page.map((c) => c.departureTime);
 
 		return {
@@ -364,7 +395,13 @@ export class TransitPlanner {
 	 * the day's timetable, its delay shard, and the stop ids a departure can
 	 * leave from (a timetable spreads them across a station's platforms).
 	 */
-	private async board(from: string, dayType: string | null | undefined): Promise<Board> {
+	private async board(
+		from: string,
+		dayType: string | null | undefined,
+		previousDayType: string | null | undefined,
+		at: number,
+		forcePrevious = false
+	): Promise<Board> {
 		const [meta, stopsIndex] = await Promise.all([this.meta(), this.stops()]);
 		const origin = this.resolveStop(stopsIndex, from);
 		if (!origin) throw new TransitError(`Station "${from}" wurde nicht gefunden.`);
@@ -378,20 +415,41 @@ export class TransitPlanner {
 		// one BPUIC - a lookup never needs more than one delay shard.
 		const station = origin.parent != null ? stopsIndex.findStopById(origin.parent) : undefined;
 		const bpuic = bpuicOf(station ?? origin) ?? bpuicOf(origin);
-		const [timetable, stationDelays] = await Promise.all([
-			this.timetable(serviceDayType),
-			useDayType && bpuic != null
-				? delays.forStation(useDayType, bpuic)
-				: Promise.resolve(null)
+
+		const segmentFor = async (type: DayType, offset: number): Promise<Segment> => {
+			// Strictly this day's shard: falling back to another day's would label
+			// one service's delays with another's.
+			const delayDayType = delays.dayTypes.includes(type) ? type : null;
+			const [timetable, stationDelays] = await Promise.all([
+				this.timetable(type),
+				delayDayType && bpuic != null
+					? delays.forStation(delayDayType, bpuic)
+					: Promise.resolve(null)
+			]);
+			return { dayType: type, timetable, stationDelays, offset };
+		};
+
+		// No fallback here either: a day the bundle doesn't carry means there is no
+		// tail to add, not that some other day's night services run tonight.
+		const previous =
+			(forcePrevious || at < PREVIOUS_DAY_TAIL_CUTOFF) &&
+			previousDayType &&
+			meta.serviceDays.includes(previousDayType as DayType)
+				? (previousDayType as DayType)
+				: null;
+		const [current, tail] = await Promise.all([
+			segmentFor(serviceDayType, 0),
+			// Best effort: the queried day must still answer if yesterday won't load.
+			previous ? segmentFor(previous, 24 * 60).catch(() => null) : Promise.resolve(null)
 		]);
+		const segments = tail ? [current, tail] : [current];
 
 		return {
 			meta,
 			stopsIndex,
 			origin,
 			serviceDayType,
-			timetable,
-			stationDelays,
+			segments,
 			boardStopIds: new Set<number>([
 				origin.id,
 				...stopsIndex.equivalentStops(origin.id).map((s) => s.id)
@@ -407,7 +465,7 @@ export class TransitPlanner {
 
 	private toDtos(board: Board, page: Candidate[]): DepartureDto[] {
 		return page
-			.map((c) => this.departureDto(board.stopsIndex, c, board.stationDelays))
+			.map((c) => this.departureDto(board.stopsIndex, c))
 			.sort(
 				(a, b) =>
 					a.plannedDepartureMinutes - b.plannedDepartureMinutes ||
@@ -418,9 +476,9 @@ export class TransitPlanner {
 
 	private departureDto(
 		stopsIndex: StopsIndex,
-		{ route, boardStopId, departureTime, serviceInfo }: Candidate,
-		stationDelays: StationDelays | null
+		{ route, boardStopId, departureTime, serviceTime, segment, serviceInfo }: Candidate
 	): DepartureDto {
+		const stationDelays = segment.stationDelays;
 		const boardStop = stopsIndex.findStopById(boardStopId)!;
 		const destStop = stopsIndex.findStopById(route.stops[route.getNbStops() - 1]);
 
@@ -434,7 +492,7 @@ export class TransitPlanner {
 			departure: eventTiming(departureTime, null)
 		};
 
-		const match = stationDelays?.match(serviceInfo.name, departureTime % (24 * 60));
+		const match = stationDelays?.match(serviceInfo.name, serviceTime % (24 * 60));
 		if (!match) return dto;
 		dto.departure = eventTiming(departureTime, {
 			delaySec: match.avg,
@@ -475,13 +533,23 @@ function parseTime(hm: string): number {
  * earlier. Each pattern reads one minute past its share, which is what lets
  * `pageOf` cut on a whole minute.
  */
-function collect(
-	{ timetable, boardStopIds }: Board,
+function collect(board: Board, end: PageEnd, at: number, limit: number): Candidate[] {
+	const candidates: Candidate[] = [];
+	for (const segment of board.segments) {
+		collectFrom(board, segment, end, at + segment.offset, limit, candidates);
+	}
+	return candidates;
+}
+
+function collectFrom(
+	{ boardStopIds }: Board,
+	segment: Segment,
 	end: PageEnd,
 	at: number,
-	limit: number
-): Candidate[] {
-	const candidates: Candidate[] = [];
+	limit: number,
+	candidates: Candidate[]
+): void {
+	const timetable = segment.timetable;
 	const seen = new Set<string>();
 	const step = end === 'later' ? 1 : -1;
 
@@ -507,13 +575,24 @@ function collect(
 				let lastTime = -1;
 				while (tripIndex >= 0 && tripIndex < nbTrips) {
 					const departureTime = route.departureFrom(stopIndex, tripIndex);
+					// Below its own midnight a segment has left the day being asked
+					// about, and trips are in departure order, so nothing further back
+					// can qualify either.
+					if (departureTime < segment.offset) break;
 					// Give up only once the page is full *and* the minute is finished.
 					if (taken >= limit && departureTime !== lastTime) break;
 					const key = `${route.id}:${tripIndex}:${stopIndex}`;
 					if (!seen.has(key)) {
 						seen.add(key);
 						serviceInfo ??= timetable.getServiceRouteInfo(route);
-						candidates.push({ route, boardStopId, departureTime, serviceInfo });
+						candidates.push({
+							route,
+							boardStopId,
+							departureTime: departureTime - segment.offset,
+							serviceTime: departureTime,
+							segment,
+							serviceInfo
+						});
 					}
 					lastTime = departureTime;
 					taken++;
@@ -522,7 +601,6 @@ function collect(
 			}
 		}
 	}
-	return candidates;
 }
 
 /**
@@ -530,6 +608,12 @@ function collect(
  * included minute - so the next page can start on that minute without repeating
  * or skipping anything.
  */
+function buildPage(board: Board, direction: Direction, at: number, limit: number): Candidate[] {
+	return direction === 'around'
+		? around(board, at, limit)
+		: pageOf(collect(board, direction, at, limit), direction, limit);
+}
+
 function pageOf(candidates: Candidate[], end: PageEnd, limit: number): Candidate[] {
 	if (candidates.length <= limit) return candidates;
 	const sorted = [...candidates].sort((a, b) => a.departureTime - b.departureTime);

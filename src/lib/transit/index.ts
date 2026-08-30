@@ -5,7 +5,7 @@ import { TransitPlanner } from './planner';
 // repeated searches only pay for data they haven't fetched yet.
 export const planner = new TransitPlanner();
 
-export { TransitError } from './planner';
+export { TransitError, PREVIOUS_DAY_TAIL_CUTOFF } from './planner';
 export type {
 	DeparturesResult,
 	DepartureDto,

@@ -11,6 +11,7 @@
 		isoDate,
 		parseIsoDate,
 		planner,
+		PREVIOUS_DAY_TAIL_CUTOFF,
 		TransitError,
 		type DayType,
 		type DepartureDto,
@@ -38,6 +39,8 @@
 	const AROUND_SIZE = 2;
 
 	const DATE_WINDOW_DAYS = 14;
+
+	const MINUTES_PER_DAY = 1440;
 
 	const DATE_FORMAT = new Intl.DateTimeFormat('de-CH', {
 		weekday: 'long',
@@ -67,6 +70,8 @@
 	// "Früher"/"Später" pages off. Clock strings can't serve, they wrap at 24:00.
 	let listEarliest = $state<number | null>(null);
 	let listLatest = $state<number | null>(null);
+	// Paging can walk off the queried date, so the shown page carries its own.
+	let listDate = $state<string | null>(null);
 	let result = $state<DepartureDto | null>(null);
 	let resultDayType = $state<DayType | null>(null);
 	let queryMeta = $state<QueryMeta | null>(null);
@@ -89,6 +94,12 @@
 
 	function dayTypeOfMeta(meta: QueryMeta): DayType {
 		return dayTypeOf(parseIsoDate(meta.date));
+	}
+
+	// Trips leaving just after midnight belong to the day before, so a lookup in
+	// the small hours has to see that day's timetable too.
+	function previousDayTypeOfMeta(meta: QueryMeta): DayType {
+		return dayTypeOf(addDays(parseIsoDate(meta.date), -1));
 	}
 
 	function nextDateOf(wanted: DayType): string {
@@ -215,16 +226,24 @@
 
 	async function runSearch(meta: QueryMeta, pick?: { line: string; dest: string | null }) {
 		busy = true;
+		listDate = null;
 		const metaDayType = dayTypeOfMeta(meta);
+		const [h, m] = meta.time.split(':').map(Number);
+		const needsPreviousDay = h * 60 + m < PREVIOUS_DAY_TAIL_CUTOFF;
 		// The first lookup of a day type pulls in its timetable (a few MB), which
-		// takes noticeably longer than the search itself — say so.
-		statusMsg = planner.isReady(metaDayType) ? 'Suche läuft …' : 'Fahrplandaten werden geladen …';
+		// takes noticeably longer than the search itself — say so. In the small
+		// hours that is two timetables, and either one can be the slow part.
+		const ready =
+			planner.isReady(metaDayType) &&
+			(!needsPreviousDay || planner.isReady(previousDayTypeOfMeta(meta)));
+		statusMsg = ready ? 'Suche läuft …' : 'Fahrplandaten werden geladen …';
 		statusError = false;
 		try {
 			const data = await planner.getDepartures({
 				from: meta.stationId,
 				time: meta.time,
-				dayType: metaDayType
+				dayType: metaDayType,
+				previousDayType: previousDayTypeOfMeta(meta)
 			});
 			if (!data.results.length) {
 				statusMsg = `Keine weiteren Abfahrten ab ${meta.stationName || meta.stationId} nach ${meta.time} Uhr am ${formatDate(meta.date)}`;
@@ -264,43 +283,78 @@
 	}
 
 	/** The minutes the shown departures span, whichever screen is showing them. */
-	function shownWindow(): { earliest: number; latest: number } | null {
-		if (screen === 'list' && listEarliest != null && listLatest != null) {
-			return { earliest: listEarliest, latest: listLatest };
+	function shownWindow(): { earliest: number; latest: number; date: string } | null {
+		if (screen === 'list' && listEarliest != null && listLatest != null && listDate) {
+			return { earliest: listEarliest, latest: listLatest, date: listDate };
 		}
 		const single =
 			screen === 'result' ? result : screen === 'select' ? selectResults[0] : null;
-		if (!single) return null;
+		if (!single || !queryMeta) return null;
 		return {
 			earliest: single.plannedDepartureMinutes,
-			latest: single.plannedDepartureMinutes
+			latest: single.plannedDepartureMinutes,
+			date: queryMeta.date
 		};
 	}
 
-	async function showPage(direction: Direction, at: number, limit: number) {
+	function fetchPage(direction: Direction, at: number, limit: number, date: string) {
+		const day = parseIsoDate(date);
+		return planner.getDepartureList({
+			from: (queryMeta as QueryMeta).stationId,
+			at,
+			dayType: dayTypeOf(day),
+			previousDayType: dayTypeOf(addDays(day, -1)),
+			direction,
+			limit
+		});
+	}
+
+	/** The neighbouring date in `direction`, or null at the edge of the window. */
+	function rolledDate(date: string, direction: Direction): string | null {
+		const next = isoDate(addDays(parseIsoDate(date), direction === 'earlier' ? -1 : 1));
+		return next < minDate || next > maxDate ? null : next;
+	}
+
+	async function showPage(direction: Direction, at: number, limit: number, date: string) {
 		if (!queryMeta) return;
 		busy = true;
 		statusMsg = '';
 		statusError = false;
 		try {
-			const data = await planner.getDepartureList({
-				from: queryMeta.stationId,
-				at,
-				dayType: dayTypeOfMeta(queryMeta),
-				direction,
-				limit
-			});
-			if (!data.results.length) {
-				statusMsg =
+			let useDate = date;
+			let useAt = at;
+			let data = await fetchPage(direction, useAt, limit, useDate);
+
+			// A date runs out of departures long before the timetable does, so an
+			// empty page steps to the neighbouring one. Both boards measure from
+			// their own midnight, which is all that separates the two anchors.
+			if (!data.results.length && direction !== 'around') {
+				const next = rolledDate(useDate, direction);
+				if (!next) {
+					statusMsg =
+						direction === 'earlier'
+							? 'Keine früheren Abfahrten im wählbaren Zeitraum.'
+							: 'Keine späteren Abfahrten im wählbaren Zeitraum.';
+					statusError = true;
+					return;
+				}
+				useDate = next;
+				useAt =
 					direction === 'earlier'
-						? 'Keine früheren Abfahrten an diesem Tag.'
-						: 'Keine späteren Abfahrten an diesem Tag.';
+						? at + MINUTES_PER_DAY
+						: Math.max(0, at - MINUTES_PER_DAY);
+				data = await fetchPage(direction, useAt, limit, useDate);
+			}
+
+			if (!data.results.length) {
+				statusMsg = `Keine ${direction === 'earlier' ? 'früheren' : 'späteren'} Abfahrten am ${formatDate(useDate)}`;
 				statusError = true;
 				return;
 			}
 			listResults = data.results;
 			listEarliest = data.earliest;
 			listLatest = data.latest;
+			listDate = useDate;
 			resultDayType = data.dayType;
 			screen = 'list';
 		} catch (err) {
@@ -316,19 +370,19 @@
 
 	function goEarlier() {
 		const window = shownWindow();
-		if (window) showPage('earlier', window.earliest, PAGE_SIZE);
+		if (window) showPage('earlier', window.earliest, PAGE_SIZE, window.date);
 	}
 
 	function goLater() {
 		// A page always holds whole minutes, so starting one minute past the last
 		// one shown skips exactly what's already on screen.
 		const window = shownWindow();
-		if (window) showPage('later', window.latest + 1, PAGE_SIZE);
+		if (window) showPage('later', window.latest + 1, PAGE_SIZE, window.date);
 	}
 
 	function showAlternatives() {
 		const window = shownWindow();
-		if (window) showPage('around', window.earliest, AROUND_SIZE);
+		if (window) showPage('around', window.earliest, AROUND_SIZE, window.date);
 	}
 
 	/**
@@ -338,6 +392,9 @@
 	function isCurrent(dto: DepartureDto) {
 		return (
 			result != null &&
+			// After a roll the page is a different date, where the same minute is
+			// a different departure.
+			(screen !== 'list' || listDate === queryMeta?.date) &&
 			dto.plannedDepartureMinutes === result.plannedDepartureMinutes &&
 			dto.line === result.line &&
 			(dto.destination?.id ?? null) === (result.destination?.id ?? null)
@@ -346,9 +403,21 @@
 
 	function pick(dto: DepartureDto, paged: boolean) {
 		const meta = queryMeta as QueryMeta;
+		if (!paged) {
+			showResult(dto, meta, resultDayType);
+			return;
+		}
 		// A departure picked off a page is no longer the one the original query
-		// asked for, so the shared link has to point at its time instead.
-		showResult(dto, paged ? { ...meta, time: dto.plannedDeparture } : meta, resultDayType);
+		// asked for, so the shared link has to point at its own date and time -
+		// and one past 24:00 belongs to the next date, counted from its midnight
+		// so that paging on from here anchors in the same day the result names.
+		const base = listDate ?? meta.date;
+		const rolls = dto.plannedDepartureMinutes >= MINUTES_PER_DAY;
+		const date = rolls ? isoDate(addDays(parseIsoDate(base), 1)) : base;
+		const picked = rolls
+			? { ...dto, plannedDepartureMinutes: dto.plannedDepartureMinutes - MINUTES_PER_DAY }
+			: dto;
+		showResult(picked, { ...meta, date, time: picked.plannedDeparture }, resultDayType);
 	}
 
 	function openPicker(e: MouseEvent) {
@@ -389,6 +458,7 @@
 		listResults = [];
 		listEarliest = null;
 		listLatest = null;
+		listDate = null;
 		queryMeta = null;
 		statusMsg = '';
 		// Keep the station and the date as they were; only the time needs to
@@ -538,9 +608,9 @@
 			<h2>Verbindungen ab {queryMeta?.stationName || 'der Haltestelle'}</h2>
 			<p class="sub">
 				{listResults[0].plannedDeparture} – {listResults[listResults.length - 1]
-					.plannedDeparture} Uhr{#if queryMeta}, {formatDate(queryMeta.date)}{:else if resultDayType}, {DAY_TYPE_LABELS[
-						resultDayType
-					]}{/if}
+					.plannedDeparture} Uhr{#if listDate ?? queryMeta?.date}, {formatDate(
+						(listDate ?? queryMeta?.date) as string
+					)}{:else if resultDayType}, {DAY_TYPE_LABELS[resultDayType]}{/if}
 			</p>
 			<button class="pager" type="button" onclick={goEarlier} disabled={busy}>↑ Früher</button>
 			{@render departureList(listResults, true)}
