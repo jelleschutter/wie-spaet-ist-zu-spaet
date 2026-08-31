@@ -183,19 +183,19 @@
 	function heroInfo(dto: DepartureDto) {
 		const avg = dto.departure.delaySeconds;
 		const buffer = dto.departure.catchBufferSeconds;
-		// The colour follows the buffer rather than the average, since that's what
-		// the note answers: whether this departure leaves you any room at all.
-		const cls = buffer == null || buffer === 0 ? 'neutral' : buffer > 0 ? 'good' : 'bad';
+		// The number is the average, coloured by what it means for you: a departure
+		// that runs late buys you time, one that runs early costs you some.
+		const cls = avg == null || avg === 0 ? 'neutral' : avg > 0 ? 'good' : 'bad';
 		const note =
 			buffer == null
 				? delaysReady
 					? 'Für diese Verbindung liegen keine Verspätungsdaten vor.'
 					: 'Für diesen Fahrplan liegen keine Verspätungsdaten vor.'
 				: buffer > 0
-					? `Wenn du auf der sicheren Seite sein möchtest, komm weniger als ${fmtDuration(buffer)} zu spät, dann schaffst du es in 9 von 10 Fällen.`
+					? `Komm weniger als ${fmtDuration(buffer)} zu spät, dann klappt es in 9 von 10 Fällen.`
 					: buffer < 0
-						? `Wenn du auf der sicheren Seite sein möchtest, sei ${fmtDuration(-buffer)} vor der planmässigen Zeit da, dann schaffst du es in 9 von 10 Fällen.`
-						: 'Wenn du auf der sicheren Seite sein möchtest, sei pünktlich da, dann schaffst du es in 9 von 10 Fällen.';
+						? `Sei ${fmtDuration(-buffer)} vor der planmässigen Zeit da, dann klappt es in 9 von 10 Fällen.`
+						: 'Sei pünktlich da, dann klappt es in 9 von 10 Fällen.';
 		if (avg == null) {
 			return { cls, num: '—', label: 'Keine Prognose möglich', note };
 		}
