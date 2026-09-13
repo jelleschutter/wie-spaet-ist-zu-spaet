@@ -263,8 +263,14 @@
 			}
 			statusMsg = '';
 			// The stop the query resolved to, not what was typed: recents are then
-			// offered back under the canonical name and re-search by id.
-			rememberStation({ id: String(data.query.from.id), name: data.query.from.name });
+			// offered back under the canonical name and re-search by id. The source
+			// stop id is the feed's own and survives a data:build; minotor's internal
+			// id is a position in stops.txt and shifts whenever the feed does.
+			const stopId = data.query.from.sourceStopId ?? String(data.query.from.id);
+			rememberStation({ id: stopId, name: data.query.from.name });
+			// A shared link should carry that same id rather than the typed name,
+			// which can rank onto a different station once the feed changes.
+			meta = { ...meta, stationId: stopId };
 			resultDayType = data.dayType;
 			const preselected = pick
 				? data.results.find(

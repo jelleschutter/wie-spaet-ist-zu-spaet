@@ -4,10 +4,21 @@
 
 	type Suggestion = {
 		id: number;
+		sourceStopId: string | null;
 		name: string;
 		locationType: string;
 		platform: string | null;
 	};
+
+	/**
+	 * What a picked station is searched and remembered by. The source stop id is
+	 * the feed's own, so it still points at the same station after a data:build;
+	 * the internal id is a position in stops.txt and only stands in when a stop
+	 * carries no source id at all.
+	 */
+	function stopKey(s: Suggestion): string {
+		return s.sourceStopId ?? String(s.id);
+	}
 
 	let {
 		value = $bindable(''),
@@ -31,7 +42,7 @@
 
 	// A station offered as a recent shouldn't show up a second time below it.
 	const matchingSuggestions = $derived(
-		suggestions.filter((s) => !matchingRecents.some((r) => r.id === String(s.id)))
+		suggestions.filter((s) => !matchingRecents.some((r) => r.id === stopKey(s)))
 	);
 
 	const hasItems = $derived(matchingRecents.length > 0 || matchingSuggestions.length > 0);
@@ -63,7 +74,7 @@
 
 	function pick(s: Suggestion) {
 		value = s.name;
-		stationId = String(s.id);
+		stationId = stopKey(s);
 		open = false;
 	}
 
@@ -97,7 +108,7 @@
 					)[0];
 					if (nearest) {
 						value = nearest.name;
-						stationId = String(nearest.id);
+						stationId = stopKey(nearest);
 					} else {
 						locateError = 'In der Nähe wurde keine Haltestelle gefunden.';
 					}

@@ -339,16 +339,19 @@ export class TransitPlanner {
 			.map((s) => this.stopDto(s));
 	}
 
-	/** Resolves a `from` argument: an internal numeric stop id, a GTFS source id, or a name. */
+	/** Resolves a `from` argument: a GTFS source id, an internal numeric stop id, or a name. */
 	private resolveStop(stopsIndex: StopsIndex, arg: string | null | undefined): Stop | undefined {
 		if (arg == null || arg === '') return undefined;
 		const str = String(arg).trim();
+		// Source ids go first. They are what links and recents carry, and the feed
+		// zero-pads the low ones ("0000132"), which would otherwise be read as an
+		// internal id and silently resolve to whatever stop sits at that index.
+		const bySource = stopsIndex.findStopBySourceStopId(str);
+		if (bySource) return bySource;
 		if (/^\d+$/.test(str)) {
 			const byId = stopsIndex.findStopById(Number(str));
 			if (byId) return byId;
 		}
-		const bySource = stopsIndex.findStopBySourceStopId(str);
-		if (bySource) return bySource;
 		const candidates = stopsIndex.findStopsByName(str, 25);
 		return rankByName(candidates, str)[0];
 	}
