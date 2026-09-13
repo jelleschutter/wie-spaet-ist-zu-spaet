@@ -975,8 +975,17 @@ export async function shard(
 	const allowedBits = new Uint8Array(maxBpuic + 1);
 	for (const bpuic of allowed) allowedBits[bpuic] = 1;
 
+	// Written next to the live shards and swapped in once every day type is done:
+	// a run that fails halfway has to leave the previous shards, which meta.json
+	// still describes, rather than no shards at all.
 	const delaysDir = path.join(outDir, 'delays');
-	fs.rmSync(delaysDir, { recursive: true, force: true });
+	const buildDir = `${delaysDir}.next`;
+	fs.rmSync(buildDir, { recursive: true, force: true });
+	ensureDir(buildDir);
+	const discard = (error) => {
+		fs.rmSync(buildDir, { recursive: true, force: true });
+		throw error;
+	};
 
 	const stations = new Set();
 	const covered = [];
@@ -997,7 +1006,7 @@ export async function shard(
 
 		const written = await timed(`${dayType} aggregation`, async () => {
 			const out = aggregateDayType(files, lineIndex, allowedBits, maxBpuic, minSamples, chunks);
-			const result = writeShards(out, path.join(delaysDir, dayType));
+			const result = writeShards(out, path.join(buildDir, dayType));
 			for (const bpuic of result.stations) stations.add(bpuic);
 			return {
 				rows: out.count,
@@ -1005,7 +1014,7 @@ export async function shard(
 				ignoredLines: out.ignoredLines,
 				...result
 			};
-		});
+		}).catch(discard);
 
 		totalRows += written.rows;
 		totalFiles += written.files;
@@ -1022,6 +1031,12 @@ export async function shard(
 			);
 		}
 	}
+
+	const oldDir = `${delaysDir}.old`;
+	fs.rmSync(oldDir, { recursive: true, force: true });
+	if (fs.existsSync(delaysDir)) fs.renameSync(delaysDir, oldDir);
+	fs.renameSync(buildDir, delaysDir);
+	fs.rmSync(oldDir, { recursive: true, force: true });
 
 	if (totalClamped) {
 		log(`  note: ${num(totalClamped)} outlier delay values clamped to +/-${I16_MAX} s`);
