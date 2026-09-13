@@ -393,8 +393,29 @@ function membersOf(archive) {
 	return days.sort((a, b) => a.date - b.date);
 }
 
-function sampleFile(dayType, date) {
-	return path.join(SAMPLES_DIR, dayType, `${isoDate(date)}.bin.zst`);
+function sampleFile(dayType, day) {
+	return path.join(SAMPLES_DIR, dayType, `${day}.bin.zst`);
+}
+
+/**
+ * The days of an archive's month that earlier runs left in the samples directory,
+ * each under the day type the calendar gives it now.
+ */
+function cachedDaysOf(archive) {
+	const month = /(\d{4})-(\d{2})\.zip$/.exec(archive);
+	if (!month) return [];
+	const found = [];
+	for (const dayType of DAY_TYPES) {
+		const dir = path.join(SAMPLES_DIR, dayType);
+		if (!fs.existsSync(dir)) continue;
+		for (const name of fs.readdirSync(dir)) {
+			const day = /^(\d{4})-(\d{2})-(\d{2})\.bin\.zst$/.exec(name);
+			if (!day || day[1] !== month[1] || day[2] !== month[2]) continue;
+			const date = new Date(Number(day[1]), Number(day[2]) - 1, Number(day[3]));
+			if (dayTypeOf(date) === dayType) found.push({ dayType, day: isoDate(date) });
+		}
+	}
+	return found.sort((a, b) => (a.day < b.day ? -1 : 1));
 }
 
 function openSampleFile(file) {
@@ -460,11 +481,20 @@ export async function extract(
 	let processed = 0;
 
 	for (const archive of archives) {
-		if (fetch !== null && !fs.existsSync(archive) && !(await fetch(archive))) {
-			continue; // not published yet - download.istdaten() has said so
-		}
-		if (!fs.existsSync(archive)) {
-			log(`  ${path.basename(archive)}: missing - skipping`);
+		if (!fs.existsSync(archive) && !(fetch !== null && (await fetch(archive)))) {
+			// Not published or not downloaded. The month is part of the window all
+			// the same, so what an earlier run extracted from it still counts.
+			const cached = cachedDaysOf(archive);
+			log(
+				`  ${path.basename(archive)}: not available - ` +
+					(cached.length ? `using ${cached.length} service days extracted earlier` : 'skipping')
+			);
+			for (const { dayType, day } of cached) {
+				if (dayLimit !== null && processed >= dayLimit) break;
+				for (const name of readSampleLines(sampleFile(dayType, day))) lines.add(name);
+				days[dayType].push(day);
+				processed++;
+			}
 			continue;
 		}
 		const members = membersOf(archive);
@@ -480,14 +510,14 @@ export async function extract(
 				return { days, lines };
 			}
 			const dayType = dayTypeOf(date);
-			const file = sampleFile(dayType, date);
+			const file = sampleFile(dayType, isoDate(date));
 			ensureDir(path.dirname(file));
 
 			// A holiday moves between day types when the calendar changes, so drop
 			// any copy of this day filed under a different one.
 			for (const other of DAY_TYPES) {
 				if (other === dayType) continue;
-				const stale = sampleFile(other, date);
+				const stale = sampleFile(other, isoDate(date));
 				if (fs.existsSync(stale)) fs.unlinkSync(stale);
 			}
 
@@ -678,7 +708,10 @@ function aggregateDayType(files, lineIndex, allowed, maxBpuic, minSamples, chunk
 		p10: null,
 		avg: null,
 		samples: null,
-		off: null
+		off: null,
+		// Samples of lines the line table doesn't have: skipped, and reported.
+		ignoredRows: 0,
+		ignoredLines: new Set()
 	};
 	out.bpuic = new Int32Array(out.capacity);
 	out.line = new Uint16Array(out.capacity);
@@ -725,10 +758,8 @@ function aggregateDayType(files, lineIndex, allowed, maxBpuic, minSamples, chunk
 			const toGlobal = new Int32Array(day.names.length);
 			for (let i = 0; i < day.names.length; i++) {
 				const global = lineIndex.get(day.names[i]);
-				if (global === undefined) {
-					throw new Error(`${file}: line "${day.names[i]}" is not in the global line table`);
-				}
-				toGlobal[i] = global;
+				if (global === undefined) out.ignoredLines.add(day.names[i]);
+				toGlobal[i] = global ?? -1;
 			}
 
 			if (sampleCount + day.rows > sampleCapacity) {
@@ -745,9 +776,13 @@ function aggregateDayType(files, lineIndex, allowed, maxBpuic, minSamples, chunk
 			for (let i = 0; i < day.rows; i++) {
 				const bpuic = day.bpuic[i];
 				if (bpuic % chunks !== chunk) continue;
+				const line = toGlobal[day.line[i]];
+				if (line < 0) {
+					out.ignoredRows++;
+					continue;
+				}
 				// bpuic (24 bits) | line (12) | minute (11) | offset (2) < 2^49
-				const key =
-					((bpuic * 4096 + toGlobal[day.line[i]]) * 2048 + day.dep[i]) * 4 + (day.off[i] + 1);
+				const key = ((bpuic * 4096 + line) * 2048 + day.dep[i]) * 4 + (day.off[i] + 1);
 				const group = groups.intern(key, groupCount);
 				if (group === groupCount) {
 					if (groupCount === groupCapacity) {
@@ -912,12 +947,14 @@ function writeShards(out, dest) {
 /**
  * Aggregates the samples per day type and writes the gzipped delay shards.
  *
+ * `days` is what extract() returned, and only those days' samples are read.
+ *
  * @returns {Promise<{ dayTypes: string[], rows: number, files: number,
  *                     bytes: number, stations: number }>}
  */
 export async function shard(
 	outDir,
-	{ lineTable, allowed, dayTypes, minSamples = 1, chunks = 4 }
+	{ lineTable, allowed, days, minSamples = 1, chunks = 4 }
 ) {
 	const lineIndex = new Map(lineTable.map((line, index) => [line, index]));
 
@@ -948,15 +985,11 @@ export async function shard(
 	let totalBytes = 0;
 	let totalClamped = 0;
 
-	for (const dayType of dayTypes) {
-		const dir = path.join(SAMPLES_DIR, dayType);
-		const files = fs.existsSync(dir)
-			? fs
-					.readdirSync(dir)
-					.filter((name) => name.endsWith('.bin.zst'))
-					.sort()
-					.map((name) => path.join(dir, name))
-			: [];
+	for (const dayType of DAY_TYPES) {
+		// The days this run extracted, not whatever the samples directory holds:
+		// files of months that have since left the window stay on disk, and
+		// neither their delays nor their lines belong in this build.
+		const files = (days[dayType] ?? []).toSorted().map((day) => sampleFile(dayType, day));
 		if (files.length === 0) {
 			log(`  ${dayType}: no samples - skipped`);
 			continue;
@@ -966,7 +999,12 @@ export async function shard(
 			const out = aggregateDayType(files, lineIndex, allowedBits, maxBpuic, minSamples, chunks);
 			const result = writeShards(out, path.join(delaysDir, dayType));
 			for (const bpuic of result.stations) stations.add(bpuic);
-			return { rows: out.count, ...result };
+			return {
+				rows: out.count,
+				ignoredRows: out.ignoredRows,
+				ignoredLines: out.ignoredLines,
+				...result
+			};
 		});
 
 		totalRows += written.rows;
@@ -977,6 +1015,12 @@ export async function shard(
 		log(
 			`  ${dayType}: ${num(written.rows)} services, ${num(written.files)} shards, ${mb(written.bytes)}`
 		);
+		if (written.ignoredRows) {
+			log(
+				`    ignored ${num(written.ignoredRows)} samples of lines not in the line table: ` +
+					[...written.ignoredLines].slice(0, 10).join(', ')
+			);
+		}
 	}
 
 	if (totalClamped) {

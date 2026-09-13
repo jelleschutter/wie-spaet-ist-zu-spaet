@@ -38,7 +38,6 @@ import {
 	DAY_TYPES,
 	FORMAT_VERSION,
 	GTFS_ZIP,
-	ISTDATEN_DIR,
 	OUT_DIR,
 	WORK_DIR,
 	die,
@@ -198,27 +197,15 @@ async function main() {
 	// --------------------------------------------------------------- delays
 	if (wanted(args, 'delays')) {
 		step('Reading Ist-Daten');
-		let archives;
-		let fetch = null;
-		if (args.prune) {
-			// Nothing is on disk yet, so name what the months ask for and let the
-			// extract loop pull each one down as it gets there.
-			const byPath = new Map(months.map((month) => [downloadStep.istdatenPath(...month), month]));
-			archives = [...byPath.keys()];
-			fetch = async (archive) => (await downloadStep.istdaten([byPath.get(archive)])).length > 0;
-		} else {
-			const keep = new Set(months.map((month) => path.basename(downloadStep.istdatenPath(...month))));
-			archives = fs.existsSync(ISTDATEN_DIR)
-				? fs
-						.readdirSync(ISTDATEN_DIR)
-						.filter((name) => keep.has(name))
-						.sort()
-						.map((name) => path.join(ISTDATEN_DIR, name))
-				: [];
-			if (archives.length === 0) {
-				die(`no Ist-Daten archives for the requested months in ${ISTDATEN_DIR}.`);
-			}
-		}
+		// Every month of the window, on disk or not: for one whose archive can't be
+		// read, extract() uses the samples an earlier run left behind.
+		const byPath = new Map(months.map((month) => [downloadStep.istdatenPath(...month), month]));
+		const archives = [...byPath.keys()];
+		// With --prune nothing is on disk yet, and the extract loop pulls each
+		// archive down as it gets there.
+		const fetch = args.prune
+			? async (archive) => (await downloadStep.istdaten([byPath.get(archive)])).length > 0
+			: null;
 
 		const { days, lines } = await delaysStep.extract(archives, {
 			dayLimit: args.days,
@@ -237,7 +224,7 @@ async function main() {
 		const summary = await delaysStep.shard(OUT_DIR, {
 			lineTable,
 			allowed,
-			dayTypes: DAY_TYPES.filter((dayType) => days[dayType].length > 0),
+			days,
 			minSamples: args.minSamples,
 			chunks: args.chunks
 		});
