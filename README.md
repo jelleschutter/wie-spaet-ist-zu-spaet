@@ -63,8 +63,8 @@ Betrieb statt einer beliebigen Woche des Jahresfahrplans. Feiertage werden dabei
 
 Ein Kurs gehört zum Betriebstag, an dem er losfährt: was am Dienstag um 00:30
 abfährt, steht meist im Montagsfahrplan, um 24:30. Eine Abfrage vor 6 Uhr liest
-deshalb auch den Vortag — aber zwei ganze Fahrpläne passen auf einem Handy nicht
-gleichzeitig in den Tab. `pipeline/tail.js` schreibt darum zu jedem Wochentag
+deshalb auch den Vortag, braucht davon aber nur die Kurse nach Mitternacht.
+`pipeline/tail.js` schreibt darum zu jedem Wochentag
 `tail.<wochentag>.bin.gz`: nur die Kurse, die nach Mitternacht noch abfahren,
 ganz und mit unveränderten Zeiten. Für den Vortag lädt der Browser diese Datei
 statt des ganzen Fahrplans. Das sind rund 3 500 Kurse (in den Nächten auf
@@ -150,6 +150,7 @@ static/data/              ausgeliefertes Bündel (nicht im Git, 215 MB, 7184 Dat
 
 src/lib/transit/          die Logik, die früher auf dem Server lief
   planner.ts              Abfahrtstafel für eine Haltestelle (minotor im Browser)
+  timetable.ts            minotors Fahrplandatei als flache Arrays lesen
   delays.ts               Verspätungs-Shards laden und Abfahrten zuordnen
   assets.ts               Laden + gzip-Dekomprimierung des Datenbündels
   holidays.ts / time.ts   Feiertage und Zeit-Helfer
@@ -158,11 +159,13 @@ src/lib/transit/          die Logik, die früher auf dem Server lief
 Was der Browser lädt: `meta.json` (~20 KB) plus den Haltestellen-Index (1.4 MB),
 einen Fahrplan (5–8 MB) pro Wochentag, danach ~20 KB pro Haltestelle. Alles
 ausser den Fahrplänen bleibt für die Session im Speicher; eine zweite Abfrage am
-selben Wochentag dauert ~10 ms. Ein geparster Fahrplan belegt dagegen mehrere
-hundert MB, und iOS beendet den Tab, lange bevor zwei davon neben dem
-Haltestellen-Index Platz haben: der Planner behält nur den Fahrplan, nach dem
-zuletzt gefragt wurde (vor 6 Uhr zusätzlich die Nachtkurse des Vortags), und
-gibt die übrigen frei, bevor der nächste heruntergeladen wird.
+selben Wochentag dauert ~10 ms. Den Fahrplan liest `timetable.ts` direkt aus
+minotors Binärformat in ein paar flache Arrays (23–36 MB), statt über minotors
+`Timetable`, das daraus rund 215 000 Objekte mit zusammen über 600 MB macht —
+mehr, als Safari auf dem iPhone einem Tab lässt. Der Planner behält trotzdem nur
+den Fahrplan, nach dem zuletzt gefragt wurde (vor 6 Uhr zusätzlich die
+Nachtkurse des Vortags), und gibt die übrigen frei, bevor der nächste
+heruntergeladen wird.
 
 Geladen wird vorab, nicht auf Zuruf: das Inline-Skript in `app.html` startet
 `meta.json` und den Haltestellen-Index, während das Dokument noch geparst wird

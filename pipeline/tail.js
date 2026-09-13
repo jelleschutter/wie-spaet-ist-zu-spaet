@@ -6,10 +6,10 @@
  *
  * A trip belongs to the service day it started on, so a departure at 00:30 on a
  * Tuesday usually sits in Monday's timetable, at 24:30. A lookup in the small
- * hours therefore reads two service days - and two whole timetables are more
- * than a phone lets a tab hold: parsed, each takes several hundred MB. All that
- * lookup reads of the previous day are its trips past 24:00, so this writes
- * those, in minotor's own format, for the browser to load instead.
+ * hours therefore reads two service days - but all it reads of the previous one
+ * are its trips past 24:00, a few thousand out of a timetable that is 5-8 MB to
+ * download. So this writes those, in minotor's own format, for the browser to
+ * load instead.
  *
  * Trips are kept whole and their times untouched: the patterns, their stops and
  * the order of their trips stay those of the full timetable, which is what lets

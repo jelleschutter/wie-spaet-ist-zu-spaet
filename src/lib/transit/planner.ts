@@ -1,25 +1,15 @@
-import { StopsIndex, Timetable } from 'minotor';
+import { StopsIndex } from 'minotor';
 import type { Stop } from 'minotor';
 import { fetchBinary, fetchJson } from './assets';
 import { DelayIndex, type DelaysMeta, type StationDelays } from './delays';
 import { formatDelay, hmToMinutes, minutesToClock, secondsToClock, type DayType } from './time';
+import { Timetable, type ServiceRouteInfo, type TimetableRoute } from './timetable';
 
-// minotor's top-level package export re-exports a `Route`/`ServiceRouteInfo`
-// pair from its *routing* module (journey legs), which shadows the
-// differently-shaped pair its *timetable* module actually uses for
-// `routesPassingThrough`/`getServiceRouteInfo` (route *patterns*, no
-// RAPTOR routing here). Derive the real types from `Timetable`'s own method
-// signatures instead of trusting the ambiguous top-level names.
-type TimetableRoute = ReturnType<Timetable['routesPassingThrough']>[number];
-type RouteServiceInfo = ReturnType<Timetable['getServiceRouteInfo']>;
-
-// getServiceRouteInfo().type is minotor's internal numeric RouteTypes enum,
-// not the human string ('RAIL', 'BUS', ...) - that stringification is only
-// exposed on the *routing*-module's journey-leg API, which this app never
-// calls (no RAPTOR routing here, just a per-stop departure board). Values
-// confirmed against the installed minotor build's bundled RouteTypes object,
-// since neither the enum nor its string-conversion helper is part of the
-// package's public exports.
+// getServiceRouteInfo().type is minotor's numeric route type (its protobuf enum
+// and its RouteTypes object number them alike), not the human string ('RAIL',
+// 'BUS', ...). Values confirmed against the installed minotor build's bundled
+// RouteTypes object, since neither the enum nor its string-conversion helper is
+// part of the package's public exports.
 const ROUTE_TYPE_LABELS: Record<number, string> = {
 	1: 'TRAM',
 	2: 'SUBWAY',
@@ -49,10 +39,10 @@ const ROUTE_TYPE_LABELS: Record<number, string> = {
 // while it is still being filled in. Only the ~20 KB delay shard is left to the
 // lookup itself.
 //
-// Timetables are kept only while they are the ones being asked for: parsed, a
-// single one takes several hundred MB, and iOS kills a tab well before it holds
-// two of them next to the stops index. For the same reason the small hours read
-// only the previous day's tail - its trips past midnight - not its timetable.
+// Memory, not time, is what gives out first on a phone. So timetables are read
+// flat rather than through minotor's Timetable (see timetable.ts), kept only
+// while they are the ones being asked for, and the small hours read just the
+// previous day's tail - its trips past midnight - not its whole timetable.
 // ---------------------------------------------------------------------------
 
 /** An error with a message meant to be shown to the user as-is. */
@@ -156,7 +146,7 @@ type Candidate = {
 	/** The same departure in its own service day's minutes, which the delays are keyed by. */
 	serviceTime: number;
 	segment: Segment;
-	serviceInfo: RouteServiceInfo;
+	serviceInfo: ServiceRouteInfo;
 };
 
 type Board = {
@@ -605,11 +595,11 @@ export class TransitPlanner {
 	): DepartureDto {
 		const stationDelays = segment.stationDelays;
 		const boardStop = stopsIndex.findStopById(boardStopId)!;
-		const destStop = stopsIndex.findStopById(route.stops[route.getNbStops() - 1]);
+		const destStop = stopsIndex.findStopById(route.stopId(route.getNbStops() - 1));
 
 		const dto: DepartureDto = {
 			line: serviceInfo.name,
-			mode: ROUTE_TYPE_LABELS[serviceInfo.type as unknown as number] ?? 'OTHER',
+			mode: ROUTE_TYPE_LABELS[serviceInfo.type] ?? 'OTHER',
 			from: this.stopDto(boardStop),
 			destination: destStop ? this.stopDto(destStop) : null,
 			plannedDeparture: minutesToClock(departureTime),
@@ -682,7 +672,7 @@ function collectFrom(
 		for (const route of timetable.routesPassingThrough(boardStopId)) {
 			const nbTrips = route.getNbTrips();
 			const lastStopIndex = route.getNbStops() - 1;
-			let serviceInfo: RouteServiceInfo | undefined;
+			let serviceInfo: ServiceRouteInfo | undefined;
 
 			for (const stopIndex of route.stopRouteIndices(boardStopId)) {
 				// The pattern's last stop is where the vehicle terminates - there's
