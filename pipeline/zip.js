@@ -1,6 +1,7 @@
 /**
- * Just enough ZIP to read the upstream archives: the central directory (with the
- * ZIP64 records as a fallback) and one member as a stream.
+ * Just enough ZIP to read the upstream archives - the central directory (with the
+ * ZIP64 records as a fallback) and one member as a stream - and to swap a single
+ * member of the GTFS bundle.
  *
  * Node has no zip reader, but it has raw inflate, and that is all these two feeds
  * need: the GTFS bundle and every Ist-Daten archive store their members with
@@ -11,6 +12,7 @@
  * archives, and compression methods other than store and deflate.
  */
 
+import { once } from 'node:events';
 import fs from 'node:fs';
 import zlib from 'node:zlib';
 
@@ -32,7 +34,10 @@ const EOCD_SEARCH = 65557;
  *             uncompressed: number, offset: number }} ZipEntry
  */
 
-/** @returns {{ zip64: boolean, entries: ZipEntry[] }} */
+/**
+ * @returns {{ zip64: boolean, entries: ZipEntry[], directoryOffset: number,
+ *             directorySize: number }}
+ */
 export function readCentralDirectory(file) {
 	const fd = fs.openSync(file, 'r');
 	try {
@@ -116,7 +121,7 @@ export function readCentralDirectory(file) {
 			entries.push({ name, method, compressed, uncompressed, offset });
 			o = extraEnd + commentLength;
 		}
-		return { zip64, entries };
+		return { zip64, entries, directoryOffset, directorySize };
 	} finally {
 		fs.closeSync(fd);
 	}
@@ -168,4 +173,112 @@ export async function readMember(file, entry) {
 	const chunks = [];
 	for await (const chunk of openMember(file, entry)) chunks.push(chunk);
 	return Buffer.concat(chunks);
+}
+
+/**
+ * Writes a copy of `source` to `dest` in which the member `name` holds `chunks`
+ * (an async iterable of Buffers) instead, deflated.
+ *
+ * Every other member keeps its bytes and its offset: the copy is the source up
+ * to its central directory, then the new member, then a central directory that
+ * points at it. The old copy of the member stays behind unreferenced, which is
+ * what spares re-deflating a 1.4 GB stop_times.txt to change a routes.txt.
+ */
+export async function replaceMember(source, dest, name, chunks) {
+	const { zip64, entries, directoryOffset, directorySize } = readCentralDirectory(source);
+	if (zip64) throw new Error(`${source}: rewriting a zip64 archive is not supported`);
+	const entry = entries.find((candidate) => candidate.name === name);
+	if (!entry) throw new Error(`${source}: no member ${name}`);
+
+	const deflate = zlib.createDeflateRaw({ level: 9 });
+	const parts = [];
+	deflate.on('data', (part) => parts.push(part));
+	const deflated = once(deflate, 'end');
+	let crc = 0;
+	let size = 0;
+	for await (const chunk of chunks) {
+		crc = zlib.crc32(chunk, crc);
+		size += chunk.length;
+		if (!deflate.write(chunk)) await once(deflate, 'drain');
+	}
+	deflate.end();
+	await deflated;
+	const data = Buffer.concat(parts);
+
+	const directory = Buffer.allocUnsafe(directorySize);
+	const sourceFd = fs.openSync(source, 'r');
+	try {
+		fs.readSync(sourceFd, directory, 0, directorySize, directoryOffset);
+	} finally {
+		fs.closeSync(sourceFd);
+	}
+
+	const records = [];
+	let o = 0;
+	for (let i = 0; i < entries.length; i++) {
+		const nameLength = directory.readUInt16LE(o + 28);
+		const end = o + 46 + nameLength + directory.readUInt16LE(o + 30) + directory.readUInt16LE(o + 32);
+		if (entries[i] !== entry) {
+			records.push(directory.subarray(o, end));
+			o = end;
+			continue;
+		}
+		const rawName = directory.subarray(o + 46, o + 46 + nameLength);
+		// Same flags minus bit 3: sizes and CRC are in the headers, not after the data.
+		const flags = directory.readUInt16LE(o + 8) & ~0x0008;
+		const local = Buffer.alloc(30 + nameLength);
+		local.writeUInt32LE(SIG_LOCAL, 0);
+		local.writeUInt16LE(20, 4);
+		local.writeUInt16LE(flags, 6);
+		local.writeUInt16LE(METHOD_DEFLATE, 8);
+		directory.copy(local, 10, o + 12, o + 16); // modification time and date
+		local.writeUInt32LE(crc, 14);
+		local.writeUInt32LE(data.length, 18);
+		local.writeUInt32LE(size, 22);
+		local.writeUInt16LE(nameLength, 26);
+		rawName.copy(local, 30);
+
+		const record = Buffer.alloc(46 + nameLength);
+		directory.copy(record, 0, o, o + 46);
+		record.writeUInt16LE(20, 6);
+		record.writeUInt16LE(flags, 8);
+		record.writeUInt16LE(METHOD_DEFLATE, 10);
+		record.writeUInt32LE(crc, 16);
+		record.writeUInt32LE(data.length, 20);
+		record.writeUInt32LE(size, 24);
+		record.writeUInt16LE(0, 30); // no extra field
+		record.writeUInt16LE(0, 32); // no comment
+		record.writeUInt32LE(directoryOffset, 42);
+		rawName.copy(record, 46);
+		records.push({ local, record });
+		o = end;
+	}
+
+	const swapped = records.find((record) => !Buffer.isBuffer(record));
+	const newDirectoryOffset = directoryOffset + swapped.local.length + data.length;
+	const newDirectory = Buffer.concat(records.map((record) => (Buffer.isBuffer(record) ? record : record.record)));
+	if (size > 0xffffffff || newDirectoryOffset + newDirectory.length > 0xffffffff) {
+		throw new Error(`${dest}: would need zip64, which this writer doesn't do`);
+	}
+	const eocd = Buffer.alloc(22);
+	eocd.writeUInt32LE(SIG_EOCD, 0);
+	eocd.writeUInt16LE(entries.length, 8);
+	eocd.writeUInt16LE(entries.length, 10);
+	eocd.writeUInt32LE(newDirectory.length, 12);
+	eocd.writeUInt32LE(newDirectoryOffset, 16);
+
+	const part = `${dest}.part`;
+	fs.copyFileSync(source, part);
+	fs.truncateSync(part, directoryOffset);
+	const fd = fs.openSync(part, 'r+');
+	try {
+		let at = directoryOffset;
+		for (const buffer of [swapped.local, data, newDirectory, eocd]) {
+			fs.writeSync(fd, buffer, 0, buffer.length, at);
+			at += buffer.length;
+		}
+	} finally {
+		fs.closeSync(fd);
+	}
+	fs.renameSync(part, dest);
 }

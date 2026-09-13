@@ -41,10 +41,11 @@ import {
 	isoDate,
 	log,
 	mb,
+	num,
 	timed,
 	weekdayIndex
 } from './layout.js';
-import { findMember, openMember, readCentralDirectory, readMember } from './zip.js';
+import { findMember, openMember, readCentralDirectory, readMember, replaceMember } from './zip.js';
 
 const MINOTOR_CLI = path.join(REPO, 'node_modules', 'minotor', 'dist', 'cli.mjs');
 const TAIL_SCRIPT = path.join(REPO, 'pipeline', 'tail.js');
@@ -53,6 +54,10 @@ const TAIL_SCRIPT = path.join(REPO, 'pipeline', 'tail.js');
 // the extended 100-1799 range, so minotor's `standard` profile is the one that
 // maps them onto its own RouteTypes enum.
 const GTFS_PROFILE = 'standard';
+
+// Part of every timetable's stamp: bump it when namedFeed() changes what minotor
+// is given, so the next run re-parses instead of reusing the old names.
+const LINE_NAMES_VERSION = 1;
 
 // Peak resident memory of one parse-gtfs run over the 2026 feed, measured: the
 // parser holds one route pattern per distinct stop list, with the arrival and
@@ -213,7 +218,104 @@ export function timetableDates(today, window = null) {
 function stampFor(gtfsZip, date) {
 	const stat = fs.statSync(gtfsZip);
 	const mtime = Math.floor(stat.mtimeMs / 1000);
-	return `${isoDate(date)}|${stat.size}|${mtime}|${GTFS_PROFILE}`;
+	return `${isoDate(date)}|${stat.size}|${mtime}|${GTFS_PROFILE}|names${LINE_NAMES_VERSION}`;
+}
+
+// The categories whose number names a line, written the way the Ist-Daten and
+// the platform displays write it: R9, RE12, S3, SN5, IR16, PE30, CC63. Under the
+// others the number in route_long_name is a train's - "EC 4", "ICE 2" - and the
+// Ist-Daten call those trains plain EC and ICE.
+const LINE_CATEGORIES = new Set(['R', 'RE', 'S', 'SN', 'IR', 'PE', 'CC']);
+
+/**
+ * "RE12" for route_short_name "RE" with route_long_name "RE 12"; null for any
+ * route whose short name is all the name there is.
+ *
+ * Only a line category plus a number of up to three digits: a route_long_name
+ * like "N1" under "RE" names something else. The space is optional, because
+ * some operators write the same line both ways - and a train listed under both
+ * spellings has to end up with one name, or its two copies stop sharing a row.
+ */
+export function fullLineName(shortName, longName) {
+	const category = shortName.trim();
+	const long = longName.trim();
+	if (!LINE_CATEGORIES.has(category) || !long.startsWith(category)) return null;
+	const number = long.slice(category.length).replace(/^ /, '');
+	return /^\d{1,3}$/.test(number) ? `${category}${number}` : null;
+}
+
+/**
+ * The feed handed to minotor: the GTFS bundle with its lines named in full.
+ *
+ * minotor names a line by route_short_name alone, and for many regional trains
+ * that is only the category - "RE", "R" - with the number in route_long_name
+ * ("RE 12"). The Ist-Daten call the same train "RE12", and so does the display
+ * on the platform. So routes.txt gets the full name as its short name wherever
+ * fullLineName() finds one, and every other member of the bundle stays as it is.
+ *
+ * @returns {Promise<string>} the rewritten bundle, reused while the source is unchanged
+ */
+export async function namedFeed(gtfsZip, { force = false } = {}) {
+	const dest = path.join(WORK_DIR, 'gtfs_named.zip');
+	const stampFile = `${dest}.stamp`;
+	const stat = fs.statSync(gtfsZip);
+	const want = `${stat.size}|${Math.floor(stat.mtimeMs / 1000)}|names${LINE_NAMES_VERSION}`;
+	if (
+		!force &&
+		fs.existsSync(dest) &&
+		fs.existsSync(stampFile) &&
+		fs.readFileSync(stampFile, 'utf8').trim() === want
+	) {
+		log('  routes.txt: reusing the feed with full line names');
+		return dest;
+	}
+
+	const { entries } = readCentralDirectory(gtfsZip);
+	const entry = findMember(entries, 'routes.txt');
+	if (!entry) die(`routes.txt is missing from ${gtfsZip}`);
+
+	let routes = 0;
+	let renamed = 0;
+	async function* rows() {
+		const lines = readline.createInterface({ input: openMember(gtfsZip, entry), crlfDelay: Infinity });
+		let shortColumn = -1;
+		let longColumn = -1;
+		let pending = '';
+		for await (const line of lines) {
+			let out = line;
+			if (shortColumn < 0) {
+				const columns = line
+					.replace(/^﻿/, '')
+					.split(',')
+					.map((column) => column.replace(/^"|"$/g, '').trim());
+				shortColumn = columns.indexOf('route_short_name');
+				longColumn = columns.indexOf('route_long_name');
+				if (shortColumn < 0 || longColumn < 0) {
+					die('routes.txt has no route_short_name or route_long_name column');
+				}
+			} else if (line) {
+				routes++;
+				const name = fullLineName(csvField(line, shortColumn), csvField(line, longColumn));
+				if (name !== null) {
+					const [start, end] = fieldBounds(line, shortColumn);
+					out = `${line.slice(0, start)}${name}${line.slice(end)}`;
+					renamed++;
+				}
+			}
+			pending += `${out}\n`;
+			if (pending.length >= 1 << 16) {
+				yield Buffer.from(pending);
+				pending = '';
+			}
+		}
+		if (pending) yield Buffer.from(pending);
+	}
+
+	ensureDir(WORK_DIR);
+	await replaceMember(gtfsZip, dest, entry.name, rows());
+	fs.writeFileSync(stampFile, want);
+	log(`  routes.txt: ${num(renamed)} of ${num(routes)} routes named in full ("RE 12" -> RE12)`);
+	return dest;
 }
 
 function gzipTo(source, dest) {
@@ -274,6 +376,8 @@ export async function build(
 		}
 	}
 
+	const feed = await namedFeed(gtfsZip, { force });
+
 	let stopsSource = null;
 	const used = {};
 
@@ -324,7 +428,7 @@ export async function build(
 							timetableBin,
 							'--stopsOutputPath',
 							stopsBin,
-							gtfsZip
+							feed
 						],
 						{ stdio: ['ignore', logFd, warnFd] }
 					);
@@ -432,6 +536,12 @@ export async function bpuics(gtfsZip) {
  * the wrong text under the wrong name the day the feed reorders its columns.
  */
 function csvField(row, index) {
+	const [start, end] = fieldBounds(row, index);
+	return row.slice(start, end).replace(/^"|"$/g, '');
+}
+
+/** Where the nth field of a CSV row starts and ends, quotes included. */
+function fieldBounds(row, index) {
 	let at = 0;
 	for (let field = 0; ; field++) {
 		let quoted = false;
@@ -442,8 +552,8 @@ function csvField(row, index) {
 			else if (char === ',' && !quoted) break;
 			at++;
 		}
-		if (field === index) return row.slice(start, at).replace(/^"|"$/g, '');
-		if (at >= row.length) return '';
+		if (field === index) return [start, at];
+		if (at >= row.length) return [row.length, row.length];
 		at++; // the comma
 	}
 }

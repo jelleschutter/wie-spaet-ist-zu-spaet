@@ -59,6 +59,21 @@ Fenster der letzten und der nächsten sieben Tage und beschreibt den aktuellen
 Betrieb statt einer beliebigen Woche des Jahresfahrplans. Feiertage werden dabei
 übersprungen (siehe unten).
 
+### Liniennamen: `RE12` statt `RE`
+
+minotor übernimmt als Liniennamen nur `route_short_name`, und dort steht bei
+vielen Regionalzügen bloss die Kategorie: `RE`, `R`. Die Nummer steht in
+`route_long_name` (`RE 12`) — und die Ist-Daten nennen denselben Zug `RE12`,
+wie die Anzeige am Perron. Bevor minotor den Feed liest, schreibt `namedFeed()`
+deshalb eine Kopie (`data/work/gtfs_named.zip`), in deren `routes.txt` solche
+Linien ihren vollen Namen tragen: bei R, RE, S, SN, IR, PE und CC, wenn der
+lange Name genau Kategorie und eine höchstens dreistellige Nummer ist, mit oder
+ohne Leerzeichen — manche Betreiber schreiben dieselbe Linie beidemal (16 993 von
+874 823 Routen). Bei EC, IC oder ICE ist diese Nummer eine
+Zugnummer, und die Ist-Daten führen dort nur die Kategorie. Alle anderen Dateien
+des ZIPs bleiben Byte für Byte, wie sie sind — `stop_times.txt` wird nicht neu
+komprimiert.
+
 ### Nach Mitternacht: nur der Rest des Vortags
 
 Ein Kurs gehört zum Betriebstag, an dem er losfährt: was am Dienstag um 00:30
@@ -116,6 +131,13 @@ braucht dafür nur die Zahl vor dem Doppelpunkt — kein SLOID, kein DIDOK-Sidec
 (Die Ist-Daten mischen 7-stellige Haltestellen- und 9-stellige Perron-Nummern;
 die Pipeline kürzt auf die ersten sieben Stellen.)
 
+Innerhalb der Haltestelle zählen Linie und Planminute. Weil die Ist-Daten je nach
+Betreiber `RE12` oder nur `RE` schreiben, sucht der Browser zuerst den Namen aus
+dem Fahrplan und danach die andere Form: `RE12` als `RE`, oder ein `RE` (aus
+einem Fahrplan ohne volle Namen) als die eine nummerierte RE-Linie dieser
+Minute. Die zweite Suche zählt nur, wenn keine andere Abfahrt derselben Minute
+die Zeile für sich beanspruchen könnte.
+
 ### Feiertage gelten als Sonntag
 
 An den landesweiten Feiertagen fährt der Sonntagsfahrplan. Neujahr,
@@ -139,7 +161,7 @@ pipeline/                 Node-Pipeline, nur Standardbibliothek
 
 data/                     nicht im Git
   raw/                    heruntergeladene Feeds (~16 GB)
-  work/                   Tagesdateien (zstd), entpackte .bin-Dateien
+  work/                   Tagesdateien (zstd), entpackte .bin-Dateien, Feed mit vollen Liniennamen
 
 static/data/              ausgeliefertes Bündel (nicht im Git, 215 MB, 7184 Dateien)
   stops.bin.gz            1.6 MB

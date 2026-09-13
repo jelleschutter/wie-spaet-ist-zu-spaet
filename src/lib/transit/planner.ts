@@ -579,8 +579,26 @@ export class TransitPlanner {
 	}
 
 	private toDtos(board: Board, page: Candidate[]): DepartureDto[] {
+		// The line names leaving in each minute, per service day, which decide
+		// whether a delay row can only be one departure's (see StationDelays.match).
+		// A page always holds whole minutes, so each set is complete.
+		const names = new Map<Segment, Map<number, Set<string>>>();
+		for (const { segment, serviceTime, serviceInfo } of page) {
+			let byMinute = names.get(segment);
+			if (!byMinute) names.set(segment, (byMinute = new Map()));
+			const minute = serviceTime % (24 * 60);
+			let taken = byMinute.get(minute);
+			if (!taken) byMinute.set(minute, (taken = new Set()));
+			taken.add(serviceInfo.name.trim());
+		}
 		return page
-			.map((c) => this.departureDto(board.stopsIndex, c))
+			.map((c) =>
+				this.departureDto(
+					board.stopsIndex,
+					c,
+					names.get(c.segment)!.get(c.serviceTime % (24 * 60))!
+				)
+			)
 			.sort(
 				(a, b) =>
 					a.plannedDepartureMinutes - b.plannedDepartureMinutes ||
@@ -591,7 +609,8 @@ export class TransitPlanner {
 
 	private departureDto(
 		stopsIndex: StopsIndex,
-		{ route, boardStopId, departureTime, serviceTime, segment, serviceInfo }: Candidate
+		{ route, boardStopId, departureTime, serviceTime, segment, serviceInfo }: Candidate,
+		taken: ReadonlySet<string>
 	): DepartureDto {
 		const stationDelays = segment.stationDelays;
 		const boardStop = stopsIndex.findStopById(boardStopId)!;
@@ -607,7 +626,7 @@ export class TransitPlanner {
 			departure: eventTiming(departureTime, null)
 		};
 
-		const match = stationDelays?.match(serviceInfo.name, serviceTime % (24 * 60));
+		const match = stationDelays?.match(serviceInfo.name, serviceTime % (24 * 60), taken);
 		if (!match) return dto;
 		dto.departure = eventTiming(departureTime, {
 			delaySec: match.avg,

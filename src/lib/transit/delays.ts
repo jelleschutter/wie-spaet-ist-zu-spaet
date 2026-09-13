@@ -73,39 +73,141 @@ function parseShard(data: Uint8Array | null): Shard | null {
 	};
 }
 
+/**
+ * The category of a line name that is one, or one plus a number: "RE" and
+ * "RE12" are both "RE". Letters only, so bus "9" never passes for line "91".
+ */
+function categoryOf(name: string): string | undefined {
+	return /^(\p{L}+)\d*$/u.exec(name)?.[1];
+}
+
+/** The global line table the shards' line indices point into. */
+class LineTable {
+	private names: string[];
+	private ids: Map<string, number>;
+	private numberedIds = new Map<string, number[]>();
+
+	constructor(names: string[]) {
+		this.names = names;
+		this.ids = new Map(names.map((line, i) => [line, i]));
+	}
+
+	id(line: string): number | undefined {
+		return this.ids.get(line);
+	}
+
+	name(id: number): string {
+		return this.names[id];
+	}
+
+	/** The lines that add a number to a category: "RE" -> RE1, RE12, RE24, ... */
+	numbered(category: string): number[] {
+		let ids = this.numberedIds.get(category);
+		if (!ids) {
+			ids = [];
+			for (let i = 0; i < this.names.length; i++) {
+				const name = this.names[i];
+				if (name.startsWith(category) && /^\d/.test(name.slice(category.length))) ids.push(i);
+			}
+			this.numberedIds.set(category, ids);
+		}
+		return ids;
+	}
+}
+
 /** One station's delay rows for one day type. */
 export class StationDelays {
-	private lineIds: Map<string, number>;
+	private lines: LineTable;
 	private rows: DataView;
 	private start: number;
 	private count: number;
 
-	constructor(lineIds: Map<string, number>, rows: DataView, start: number, count: number) {
-		this.lineIds = lineIds;
+	constructor(lines: LineTable, rows: DataView, start: number, count: number) {
+		this.lines = lines;
 		this.rows = rows;
 		this.start = start;
 		this.count = count;
 	}
 
 	/**
-	 * The delay statistics for a scheduled departure, matched on line + exact
-	 * planned time-of-day, or undefined when this service has no Ist-Daten.
+	 * The delay statistics for a scheduled departure at its planned minute, or
+	 * undefined when this service has no Ist-Daten. `taken` holds the line names
+	 * of every departure the board has in that minute, this one's included.
+	 *
+	 * Rows are keyed by the Ist-Daten's line text, and the two feeds don't always
+	 * name a train alike. The pipeline gives the timetable a line's full name
+	 * where the GTFS feed has one ("RE12", from route_long_name "RE 12"), but the
+	 * Ist-Daten call some trains by that name and others only by their category
+	 * ("RE"), depending on the operator - and a timetable built before that knows
+	 * only the category. So a departure is looked up by its own name first and by
+	 * the other form after. Those second lookups only count when nothing else in
+	 * the minute could own the row: a guess must never borrow another train's
+	 * statistics.
 	 */
-	match(line: string, plannedDepMin: number): DepartureMatch | undefined {
-		const lineIdx = this.lineIds.get(line.trim());
-		if (lineIdx === undefined) return undefined;
-		const target = lineIdx * MINUTES_PER_DAY + plannedDepMin;
+	match(line: string, plannedDepMin: number, taken: ReadonlySet<string>): DepartureMatch | undefined {
+		const name = line.trim();
+		const exact = this.exact(name, plannedDepMin);
+		if (exact) return exact;
+		const category = categoryOf(name);
+		if (category === undefined) return undefined;
+		return category === name
+			? this.byNumber(category, plannedDepMin, taken)
+			: this.byCategory(name, category, plannedDepMin, taken);
+	}
 
+	private exact(name: string, plannedDepMin: number): DepartureMatch | undefined {
+		const lineIdx = this.lines.id(name);
+		if (lineIdx === undefined) return undefined;
+		const row = this.find(lineIdx, plannedDepMin);
+		return row < 0 ? undefined : this.rowAt(row);
+	}
+
+	/** "RE12" by the Ist-Daten's plain "RE" - when it is the only RE in the minute. */
+	private byCategory(
+		name: string,
+		category: string,
+		plannedDepMin: number,
+		taken: ReadonlySet<string>
+	): DepartureMatch | undefined {
+		for (const other of taken) {
+			if (other !== name && categoryOf(other) === category) return undefined;
+		}
+		return this.exact(category, plannedDepMin);
+	}
+
+	/**
+	 * Plain "RE" by the Ist-Daten's "RE12" - when exactly one numbered RE leaves
+	 * in the minute and no other departure goes by its name.
+	 */
+	private byNumber(
+		category: string,
+		plannedDepMin: number,
+		taken: ReadonlySet<string>
+	): DepartureMatch | undefined {
+		let found = -1;
+		for (const lineIdx of this.lines.numbered(category)) {
+			if (taken.has(this.lines.name(lineIdx))) continue;
+			const row = this.find(lineIdx, plannedDepMin);
+			if (row < 0) continue;
+			if (found >= 0) return undefined;
+			found = row;
+		}
+		return found < 0 ? undefined : this.rowAt(found);
+	}
+
+	/** The row of a line at a planned minute, or -1; a station's rows are sorted by that key. */
+	private find(lineIdx: number, plannedDepMin: number): number {
+		const target = lineIdx * MINUTES_PER_DAY + plannedDepMin;
 		let lo = this.start;
 		let hi = this.start + this.count - 1;
 		while (lo <= hi) {
 			const mid = (lo + hi) >>> 1;
 			const key = this.keyAt(mid);
-			if (key === target) return this.rowAt(mid);
+			if (key === target) return mid;
 			if (key < target) lo = mid + 1;
 			else hi = mid - 1;
 		}
-		return undefined;
+		return -1;
 	}
 
 	private keyAt(row: number): number {
@@ -126,12 +228,12 @@ export class StationDelays {
 
 export class DelayIndex {
 	private meta: DelaysMeta;
-	private lineIds: Map<string, number>;
+	private lines: LineTable;
 	private shards = new Map<string, Promise<Shard | null>>();
 
 	constructor(meta: DelaysMeta, lines: string[]) {
 		this.meta = meta;
-		this.lineIds = new Map(lines.map((line, i) => [line, i]));
+		this.lines = new LineTable(lines);
 	}
 
 	/** Day types that have aggregated delay data, e.g. ['weekday', 'saturday']. */
@@ -166,6 +268,6 @@ export class DelayIndex {
 		const loaded = await shard;
 		const entry = loaded?.stations.get(bpuic);
 		if (!loaded || !entry) return null;
-		return new StationDelays(this.lineIds, loaded.rows, entry.start, entry.count);
+		return new StationDelays(this.lines, loaded.rows, entry.start, entry.count);
 	}
 }
