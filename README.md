@@ -25,7 +25,7 @@ Drei Schritte, jeder einzeln aufrufbar (`--only`) und jeder fortsetzbar:
 | Schritt | Quelle | Ergebnis | Dauer |
 | --- | --- | --- | --- |
 | `download` | [geops GTFS](https://gtfs.geops.ch/dl/gtfs_complete.zip) (165 MB) und 12 Monats­archive [Ist-Daten](https://archive.opentransportdata.swiss/istdaten/) (je ~1.3 GB) | `data/raw/` | ~10 min |
-| `timetables` | GTFS | `stops.bin.gz` + 7× `timetable.<wochentag>.bin.gz` | ~9 min pro Wochentag |
+| `timetables` | GTFS | `stops.bin.gz` + 7× `timetable.<wochentag>.bin.gz` + 7× `tail.<wochentag>.bin.gz` | ~9 min pro Wochentag |
 | `delays` | Ist-Daten | `delays/<wochentag>/<n>.bin.gz` | ~2 s pro Kalendertag, 12 Monate in ~18 min |
 
 Nützliche Flags: `--days 3` (nur drei Ist-Daten-Tage, für einen schnellen
@@ -58,6 +58,22 @@ Wochentag, sonst höchstens drei Tage entfernt. Damit bleibt jeder Fahrplan im
 Fenster der letzten und der nächsten sieben Tage und beschreibt den aktuellen
 Betrieb statt einer beliebigen Woche des Jahresfahrplans. Feiertage werden dabei
 übersprungen (siehe unten).
+
+### Nach Mitternacht: nur der Rest des Vortags
+
+Ein Kurs gehört zum Betriebstag, an dem er losfährt: was am Dienstag um 00:30
+abfährt, steht meist im Montagsfahrplan, um 24:30. Eine Abfrage vor 6 Uhr liest
+deshalb auch den Vortag — aber zwei ganze Fahrpläne passen auf einem Handy nicht
+gleichzeitig in den Tab. `pipeline/tail.js` schreibt darum zu jedem Wochentag
+`tail.<wochentag>.bin.gz`: nur die Kurse, die nach Mitternacht noch abfahren,
+ganz und mit unveränderten Zeiten. Für den Vortag lädt der Browser diese Datei
+statt des ganzen Fahrplans. Das sind rund 3 500 Kurse (in den Nächten auf
+Samstag und Sonntag gut 7 000) und 0.2–0.4 MB statt 5–8 MB; eine Abfrage vor
+6 Uhr braucht damit kaum mehr Speicher als eine tagsüber.
+
+Eine eigene Datei, statt die Kurse in den Fahrplan des Folgetags zu schreiben,
+weil erst der Browser weiss, welcher Tag davorliegt: nach einem Feiertag fahren
+die Nachtkurse des Sonntagsfahrplans, nicht die des Wochentags.
 
 ### Verspätungen: warum vorberechnet
 
@@ -116,6 +132,7 @@ pipeline/                 Node-Pipeline, nur Standardbibliothek
   build.js                Orchestrierung + CLI
   download.js             GTFS und Ist-Daten holen (resumable)
   timetables.js           minotor-CLI pro Wochentag aufrufen
+  tail.js                 die Kurse nach Mitternacht aus einem Fahrplan schneiden
   delays.js               Ist-Daten aggregieren und Shards schreiben
   zip.js                  ZIP lesen (Central Directory, ZIP64, streamend)
   layout.js               Pfade, Konstanten, Binärformat
@@ -124,9 +141,10 @@ data/                     nicht im Git
   raw/                    heruntergeladene Feeds (~16 GB)
   work/                   Tagesdateien (zstd), entpackte .bin-Dateien
 
-static/data/              ausgeliefertes Bündel (nicht im Git, 213 MB, 7177 Dateien)
+static/data/              ausgeliefertes Bündel (nicht im Git, 215 MB, 7184 Dateien)
   stops.bin.gz            1.6 MB
   timetable.<tag>.bin.gz  5.4 MB (So) bis 8.5 MB (Fr), zusammen 54 MB
+  tail.<tag>.bin.gz       Kurse nach Mitternacht, 0.2 MB bis 0.4 MB (Fr, Sa)
   delays/<tag>/<n>.bin.gz 1024 Shards pro Wochentag, zusammen 158 MB
   meta.json               Wochentage, Abdeckung, globale Linientabelle
 
@@ -139,8 +157,12 @@ src/lib/transit/          die Logik, die früher auf dem Server lief
 
 Was der Browser lädt: `meta.json` (~20 KB) plus den Haltestellen-Index (1.4 MB),
 einen Fahrplan (5–8 MB) pro Wochentag, danach ~20 KB pro Haltestelle. Alles
-bleibt für die Session im Speicher; eine zweite Abfrage am selben Wochentag
-dauert ~10 ms.
+ausser den Fahrplänen bleibt für die Session im Speicher; eine zweite Abfrage am
+selben Wochentag dauert ~10 ms. Ein geparster Fahrplan belegt dagegen mehrere
+hundert MB, und iOS beendet den Tab, lange bevor zwei davon neben dem
+Haltestellen-Index Platz haben: der Planner behält nur den Fahrplan, nach dem
+zuletzt gefragt wurde (vor 6 Uhr zusätzlich die Nachtkurse des Vortags), und
+gibt die übrigen frei, bevor der nächste heruntergeladen wird.
 
 Geladen wird vorab, nicht auf Zuruf: das Inline-Skript in `app.html` startet
 `meta.json` und den Haltestellen-Index, während das Dokument noch geparst wird
@@ -148,8 +170,8 @@ Geladen wird vorab, nicht auf Zuruf: das Inline-Skript in `app.html` startet
 hängt den Fahrplan des im Formular gewählten Tages hinten dran, während die
 Eingaben noch gemacht werden. Der Reihe nach, nicht gleichzeitig: die
 Haltestellensuche kommt zuerst und soll sich die Leitung nicht mit ein paar MB
-Fahrplan teilen. Bei einer Abfrage in den frühen Morgenstunden kommt der
-Vortag dazu (Nachtkurse), bei gesetztem Data-Saver gar nichts.
+Fahrplan teilen. Bei einer Abfrage in den frühen Morgenstunden kommen die
+Nachtkurse des Vortags dazu, bei gesetztem Data-Saver gar nichts.
 
 Ein Durchlauf über 12 Monate ergibt 26.6 Mio. Kurse (3.2–4.2 Mio. pro
 Wochentag) an 24 755 Haltestellen. Der Median liegt bei 20–32 Messungen pro
@@ -179,7 +201,7 @@ sich das mit `BASE_PATH=/wie-spaet-ist-zu-spaet npm run build` nachstellen.
 
 ### Die Daten baut CI
 
-**`static/data/` liegt nicht im Git** — 213 MB in 7177 Dateien, und jede
+**`static/data/` liegt nicht im Git** — 215 MB in 7184 Dateien, und jede
 Aktualisierung würde dieselbe Menge noch einmal in die History legen. Stattdessen
 erzeugt der Workflow das Bündel selbst, in zwei Jobs, die parallel laufen und
 ihre Hälfte getrennt cachen:

@@ -243,10 +243,11 @@
 		const metaDayType = dayTypeOfMeta(meta);
 		// The first lookup of a day type pulls in its timetable (a few MB), which
 		// takes noticeably longer than the search itself — say so. In the small
-		// hours that is two timetables, and either one can be the slow part.
-		const ready =
-			planner.isReady(metaDayType) &&
-			(!needsPreviousDay(meta.time) || planner.isReady(previousDayTypeOfMeta(meta)));
+		// hours the previous day's trips past midnight come on top.
+		const ready = planner.isReady(
+			metaDayType,
+			needsPreviousDay(meta.time) ? previousDayTypeOfMeta(meta) : null
+		);
 		statusMsg = ready ? 'Suche läuft …' : 'Fahrplandaten werden geladen …';
 		statusError = false;
 		try {

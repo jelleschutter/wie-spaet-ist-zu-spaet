@@ -7,7 +7,8 @@
  * Three steps, each skippable and each resumable:
  *
  *   1. download    the geops GTFS feed and the last 12 monthly Ist-Daten archives
- *   2. timetables  one minotor timetable per weekday, plus the stops index
+ *   2. timetables  one minotor timetable per weekday and its trips past midnight,
+ *                  plus the stops index
  *   3. delays      per-station delay statistics, sharded per weekday
  *
  * Nothing else runs before deployment: `npm run build` only bundles the frontend

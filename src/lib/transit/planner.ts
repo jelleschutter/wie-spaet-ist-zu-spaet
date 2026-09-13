@@ -42,11 +42,17 @@ const ROUTE_TYPE_LABELS: Record<number, string> = {
 // RAPTOR A-to-B route, so there's no Router/Query here, just the Timetable's
 // per-stop route index.
 //
-// Everything is cached for the session, and the two big files are fetched
-// before they are asked for rather than on demand: app.html starts the stops
-// index (~1.5 MB) while the document is still parsing, and `preload` follows it
-// with the timetable of the day in the form (~5-8 MB) while it is still being
-// filled in. Only the ~20 KB delay shard is left to the lookup itself.
+// Everything but the timetables is cached for the session, and the two big
+// files are fetched before they are asked for rather than on demand: app.html
+// starts the stops index (~1.5 MB) while the document is still parsing, and
+// `preload` follows it with the timetable of the day in the form (~5-8 MB)
+// while it is still being filled in. Only the ~20 KB delay shard is left to the
+// lookup itself.
+//
+// Timetables are kept only while they are the ones being asked for: parsed, a
+// single one takes several hundred MB, and iOS kills a tab well before it holds
+// two of them next to the stops index. For the same reason the small hours read
+// only the previous day's tail - its trips past midnight - not its timetable.
 // ---------------------------------------------------------------------------
 
 /** An error with a message meant to be shown to the user as-is. */
@@ -128,8 +134,9 @@ export type DepartureListResult = {
 /**
  * One service day's contribution to a board. A trip belongs to the day it
  * *started*, so the ones leaving a stop just after midnight sit in the previous
- * day's timetable at 24:00 and beyond; `offset` (1440 for that day, 0 for the
- * current one) converts them to the clock of the day being asked about.
+ * day's timetable at 24:00 and beyond - and in its tail, which holds just those;
+ * `offset` (1440 for that day, 0 for the current one) converts them to the clock
+ * of the day being asked about.
  */
 type Segment = {
 	dayType: DayType;
@@ -137,6 +144,9 @@ type Segment = {
 	stationDelays: StationDelays | null;
 	offset: number;
 };
+
+/** A timetable on its way in, or in; `lookups` counts the lookups waiting for it. */
+type TimetableLoad = { promise: Promise<Timetable>; lookups: number };
 
 type Candidate = {
 	route: TimetableRoute;
@@ -165,25 +175,47 @@ type Board = {
 };
 
 /** Night services run to about 03:45, so a lookup above this hour has nothing to
- *  gain from the previous day's timetable and shouldn't fetch its few MB. */
+ *  gain from the previous day's tail and shouldn't fetch it. */
 export const PREVIOUS_DAY_TAIL_CUTOFF = 6 * 60;
+
+function timetableFile(dayType: DayType): string {
+	return `timetable.${dayType}.bin.gz`;
+}
+
+/** Just the trips of a service day that still depart past midnight, see pipeline/tail.js. */
+function tailFile(dayType: DayType): string {
+	return `tail.${dayType}.bin.gz`;
+}
 
 export class TransitPlanner {
 	private metaPromise?: Promise<StaticMeta>;
 	private stopsPromise?: Promise<StopsIndex>;
 	/** The stops index' *download*, which finishes a second before the index does. */
 	private stopsFetched?: Promise<unknown>;
-	private timetablePromises = new Map<DayType, Promise<Timetable>>();
+	private timetableLoads = new Map<string, TimetableLoad>();
+	/**
+	 * The timetable files the latest lookup or preload asked for. Starting a
+	 * download first drops every timetable not in here, so the one it replaces
+	 * is already released by the time the new one is parsed.
+	 */
+	private keep: string[] = [];
 	private delaysPromise?: Promise<DelayIndex>;
 	private stopsLoaded = false;
-	private timetablesLoaded = new Set<DayType>();
-	/** Day types queued for a background preload, in the order they are wanted. */
-	private warmWanted: DayType[] = [];
+	private timetablesLoaded = new Set<string>();
+	/** Timetable files queued for a background preload, in the order they are wanted. */
+	private warmWanted: { dayType: DayType; file: string }[] = [];
 	private warmRunning = false;
 
-	/** Whether a lookup for this day type can be answered without more downloads. */
-	isReady(dayType: DayType): boolean {
-		return this.stopsLoaded && this.timetablesLoaded.has(dayType);
+	/**
+	 * Whether a lookup on this day type can be answered without more downloads -
+	 * with `previousDayType`, one in the small hours, which reads that day's tail.
+	 */
+	isReady(dayType: DayType, previousDayType?: DayType | null): boolean {
+		return (
+			this.stopsLoaded &&
+			this.timetablesLoaded.has(timetableFile(dayType)) &&
+			(previousDayType == null || this.timetablesLoaded.has(tailFile(previousDayType)))
+		);
 	}
 
 	/** Metadata of the static bundle: available service days, delay coverage, lines. */
@@ -220,19 +252,41 @@ export class TransitPlanner {
 		return this.stopsPromise;
 	}
 
-	private timetable(dayType: DayType): Promise<Timetable> {
-		const cached = this.timetablePromises.get(dayType);
+	private timetable(file: string): TimetableLoad {
+		const cached = this.timetableLoads.get(file);
 		if (cached) return cached;
-		const promise = fetchBinary(`timetable.${dayType}.bin.gz`).then((data) => {
+		for (const other of this.timetableLoads.keys()) {
+			if (this.keep.includes(other)) continue;
+			this.timetableLoads.delete(other);
+			this.timetablesLoaded.delete(other);
+		}
+		const load = { lookups: 0 } as TimetableLoad;
+		load.promise = fetchBinary(file).then((data) => {
+			// Asked away from while it downloaded. Unless a lookup is still waiting
+			// for it, parsing it would only put it next to the one that replaces it.
+			if (load.lookups === 0 && !this.keep.includes(file)) {
+				throw new Error(`${file} was superseded`);
+			}
 			const timetable = Timetable.fromData(data as Uint8Array);
-			this.timetablesLoaded.add(dayType);
+			if (this.timetableLoads.get(file) === load) this.timetablesLoaded.add(file);
 			return timetable;
 		});
-		promise.catch(() => {
-			if (this.timetablePromises.get(dayType) === promise) this.timetablePromises.delete(dayType);
+		load.promise.catch(() => {
+			if (this.timetableLoads.get(file) === load) this.timetableLoads.delete(file);
 		});
-		this.timetablePromises.set(dayType, promise);
-		return promise;
+		this.timetableLoads.set(file, load);
+		return load;
+	}
+
+	/** A timetable for a lookup, which gets parsed even if a newer request drops it meanwhile. */
+	private async lookupTimetable(file: string): Promise<Timetable> {
+		const load = this.timetable(file);
+		load.lookups++;
+		try {
+			return await load.promise;
+		} finally {
+			load.lookups--;
+		}
 	}
 
 	private delays(): Promise<DelayIndex> {
@@ -253,19 +307,21 @@ export class TransitPlanner {
 	}
 
 	/**
-	 * Warms the timetables a lookup on these days would need, so the lookup
-	 * itself doesn't have to download a few MB first. The list replaces whatever
-	 * was queued and not yet started: paging through dates should end up with
-	 * the day that is actually selected, not one timetable per date touched on
-	 * the way there.
+	 * Warms the timetable a lookup on this day would need - and with
+	 * `previousDayType` the tail one in its small hours reads too - so the lookup
+	 * itself doesn't have to download a few MB first. This replaces whatever was
+	 * queued and not yet started, and whatever was loaded is dropped once the
+	 * next download starts: paging through dates should end up with the day that
+	 * is actually selected, not one timetable per date touched on the way there.
 	 */
-	preload(...dayTypes: (DayType | null | undefined)[]): void {
+	preload(dayType: DayType, previousDayType?: DayType | null): void {
 		// A timetable is several MB the visitor may never ask for, so an explicit
 		// data-saver setting means waiting until they do.
 		if ((navigator as { connection?: { saveData?: boolean } }).connection?.saveData) return;
-		this.warmWanted = dayTypes.filter(
-			(d): d is DayType => d != null && !this.timetablePromises.has(d)
-		);
+		const wanted = [{ dayType, file: timetableFile(dayType) }];
+		if (previousDayType) wanted.push({ dayType: previousDayType, file: tailFile(previousDayType) });
+		this.keep = wanted.map((w) => w.file);
+		this.warmWanted = wanted.filter((w) => !this.timetableLoads.has(w.file));
 		if (!this.warmRunning) void this.warmPump();
 	}
 
@@ -284,12 +340,13 @@ export class TransitPlanner {
 			void this.stops().catch(() => {});
 			await this.stopsFetched?.catch(() => {});
 			for (;;) {
-				const dayType = this.warmWanted.shift();
-				if (!dayType) return;
+				const next = this.warmWanted.shift();
+				if (!next) return;
 				// A day the bundle doesn't carry has no file to fetch.
-				if (meta && !meta.serviceDays.includes(dayType)) continue;
-				if (this.timetablePromises.has(dayType)) continue;
-				await this.timetable(dayType).catch(() => {});
+				if (meta && !meta.serviceDays.includes(next.dayType)) continue;
+				// A lookup since has asked for other files, and it is those that are kept.
+				if (!this.keep.includes(next.file) || this.timetableLoads.has(next.file)) continue;
+				await this.timetable(next.file).promise.catch(() => {});
 			}
 		} finally {
 			this.warmRunning = false;
@@ -430,7 +487,7 @@ export class TransitPlanner {
 
 		// An `earlier` page walks backwards past its anchor, so it can reach the
 		// hours the previous service day covers even when the anchor itself sat
-		// above the cutoff. Only then is that timetable worth fetching.
+		// above the cutoff. Only then is that day's tail worth fetching.
 		if (direction === 'earlier' && board.segments.length === 1) {
 			const reached = page.length ? Math.min(...page.map((c) => c.departureTime)) : 0;
 			if (reached < PREVIOUS_DAY_TAIL_CUTOFF) {
@@ -479,12 +536,12 @@ export class TransitPlanner {
 		const station = origin.parent != null ? stopsIndex.findStopById(origin.parent) : undefined;
 		const bpuic = bpuicOf(station ?? origin) ?? bpuicOf(origin);
 
-		const segmentFor = async (type: DayType, offset: number): Promise<Segment> => {
+		const segmentFor = async (type: DayType, file: string, offset: number): Promise<Segment> => {
 			// Strictly this day's shard: falling back to another day's would label
 			// one service's delays with another's.
 			const delayDayType = delays.dayTypes.includes(type) ? type : null;
 			const [timetable, stationDelays] = await Promise.all([
-				this.timetable(type),
+				this.lookupTimetable(file),
 				delayDayType && bpuic != null
 					? delays.forStation(delayDayType, bpuic)
 					: Promise.resolve(null)
@@ -500,10 +557,15 @@ export class TransitPlanner {
 			meta.serviceDays.includes(previousDayType as DayType)
 				? (previousDayType as DayType)
 				: null;
+		this.keep = previous
+			? [timetableFile(serviceDayType), tailFile(previous)]
+			: [timetableFile(serviceDayType)];
 		const [current, tail] = await Promise.all([
-			segmentFor(serviceDayType, 0),
+			segmentFor(serviceDayType, timetableFile(serviceDayType), 0),
 			// Best effort: the queried day must still answer if yesterday won't load.
-			previous ? segmentFor(previous, 24 * 60).catch(() => null) : Promise.resolve(null)
+			previous
+				? segmentFor(previous, tailFile(previous), 24 * 60).catch(() => null)
+				: Promise.resolve(null)
 		]);
 		const segments = tail ? [current, tail] : [current];
 

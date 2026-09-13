@@ -1,5 +1,6 @@
 /**
- * Builds the minotor stops index and one timetable per weekday from the GTFS feed.
+ * Builds the minotor stops index and one timetable per weekday from the GTFS feed,
+ * plus each timetable's trips past midnight (see tail.js).
  *
  * minotor's `.bin` files are its own protobuf format and its GTFS parser is what
  * defines them (route patterns, stop adjacency, trip continuations), so this
@@ -46,6 +47,7 @@ import {
 import { findMember, openMember, readCentralDirectory, readMember } from './zip.js';
 
 const MINOTOR_CLI = path.join(REPO, 'node_modules', 'minotor', 'dist', 'cli.mjs');
+const TAIL_SCRIPT = path.join(REPO, 'pipeline', 'tail.js');
 
 // The geops feed uses standard GTFS route types (0 tram, 2 rail, 3 bus, ...), not
 // the extended 100-1799 range, so minotor's `standard` profile is the one that
@@ -263,9 +265,9 @@ export async function build(
 
 	ensureDir(WORK_DIR);
 	ensureDir(OUT_DIR);
-	// Drop timetables from an earlier run whose day types no longer exist.
+	// Drop timetables and tails from an earlier run whose day types no longer exist.
 	for (const name of fs.readdirSync(OUT_DIR)) {
-		const match = /^timetable\.(.+)\.bin\.gz$/.exec(name);
+		const match = /^(?:timetable|tail)\.(.+)\.bin\.gz$/.exec(name);
 		if (match && !DAY_TYPES.includes(match[1])) {
 			log(`  removing stale ${name}`);
 			fs.unlinkSync(path.join(OUT_DIR, name));
@@ -355,6 +357,29 @@ export async function build(
 		log(
 			`    timetable.${dayType}.bin.gz  ${mb(fs.statSync(timetableBin).size)} -> ${mb(size)}`
 		);
+
+		const tailBin = path.join(WORK_DIR, `tail.${dayType}.bin`);
+		const tailStampFile = path.join(WORK_DIR, `tail.${dayType}.stamp`);
+		const tailFresh =
+			fresh &&
+			fs.existsSync(tailBin) &&
+			fs.existsSync(tailStampFile) &&
+			fs.readFileSync(tailStampFile, 'utf8').trim() === want;
+		if (!tailFresh) {
+			fs.rmSync(tailBin, { force: true });
+			const result = spawnSync(
+				node,
+				[`--max-old-space-size=${heapMb}`, TAIL_SCRIPT, timetableBin, tailBin],
+				{ stdio: ['ignore', 'inherit', 'inherit'] }
+			);
+			if (result.status !== 0 || !fs.existsSync(tailBin)) {
+				die(`cutting the tail of timetable.${dayType}: ${whyItStopped(result, heapMb)}.`);
+			}
+			fs.writeFileSync(tailStampFile, want);
+		}
+		const tailSize = gzipTo(tailBin, path.join(OUT_DIR, `tail.${dayType}.bin.gz`));
+		log(`    tail.${dayType}.bin.gz  ${mb(fs.statSync(tailBin).size)} -> ${mb(tailSize)}`);
+
 		if (stopsSource === null) stopsSource = stopsBin;
 	}
 
