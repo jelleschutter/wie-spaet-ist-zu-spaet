@@ -146,22 +146,33 @@
 </script>
 
 <div class="field">
-	<div class="field-head">
-		<label for="station">Abfahrtsort</label>
-		<button type="button" class="locate-btn" onclick={useMyLocation} disabled={locating}>
-			📍 {locating ? 'Suche …' : 'Mein Standort'}
+	<label for="station">Bahnhof / Haltestelle</label>
+	<div class="station-box">
+		<input
+			type="text"
+			id="station"
+			placeholder="z. B. Baden"
+			autocomplete="off"
+			bind:value
+			oninput={onInput}
+			onfocus={() => (open = hasItems)}
+			onblur={() => setTimeout(() => (open = false), 150)}
+		/>
+		<button
+			type="button"
+			class="locate-btn"
+			class:locating
+			onclick={useMyLocation}
+			disabled={locating}
+			aria-label={locating ? 'Standort wird ermittelt …' : 'Mein Standort verwenden'}
+		>
+			<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+				<circle cx="12" cy="12" r="3"></circle>
+				<path d="M12 2v3M12 19v3M2 12h3M19 12h3"></path>
+				<circle cx="12" cy="12" r="7"></circle>
+			</svg>
 		</button>
 	</div>
-	<input
-		type="text"
-		id="station"
-		placeholder="z. B. Baden"
-		autocomplete="off"
-		bind:value
-		oninput={onInput}
-		onfocus={() => (open = hasItems)}
-		onblur={() => setTimeout(() => (open = false), 150)}
-	/>
 	{#if open}
 		<div class="ac">
 			{#each matchingRecents as r (r.id)}

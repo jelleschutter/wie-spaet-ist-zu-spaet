@@ -2,7 +2,7 @@
 	import { onMount } from 'svelte';
 	import { replaceState } from '$app/navigation';
 	import StationAutocomplete from '$lib/components/StationAutocomplete.svelte';
-	import { rememberStation } from '$lib/recentStations';
+	import { recentStations, rememberStation, type RecentStation } from '$lib/recentStations';
 	import {
 		addDays,
 		dayTypeOf,
@@ -12,6 +12,7 @@
 		parseIsoDate,
 		planner,
 		PREVIOUS_DAY_TAIL_CUTOFF,
+		secondsToClock,
 		TransitError,
 		type DayType,
 		type DepartureDto,
@@ -30,13 +31,14 @@
 
 	type QueryMeta = { stationId: string; stationName: string; time: string; date: string };
 
-	const TAGLINE = 'Finde heraus, wie viel Verspätung du dir leisten kannst.';
-
 	/** How many connections one "Früher"/"Später" step shows. */
 	const PAGE_SIZE = 5;
 
-	/** How many either side of the current departure "Alternative Verbindungen" opens with. */
+	/** How many either side of the next (or current) departure the board opens with. */
 	const AROUND_SIZE = 2;
+
+	/** How many recent stations the start screen offers as chips. */
+	const RECENT_CHIPS = 3;
 
 	const DATE_WINDOW_DAYS = 14;
 
@@ -50,21 +52,24 @@
 
 	const DAY_MONTH_FORMAT = new Intl.DateTimeFormat('de-CH', { day: '2-digit', month: '2-digit' });
 
-	let screen = $state<'form' | 'select' | 'result' | 'list'>('form');
+	const WEEKDAY_SHORT_FORMAT = new Intl.DateTimeFormat('de-CH', { weekday: 'short' });
+
+	let screen = $state<'form' | 'board' | 'result'>('form');
 	let stationName = $state('');
 	let stationId = $state<string | null>(null);
-	let time = $state('');
+	/** "Jetzt" keeps time and date on the current moment; "Später" lets you pick them. */
+	let when = $state<'now' | 'later'>('now');
+	let time = $state(new Date().toTimeString().slice(0, 5));
 	let date = $state(isoDate(new Date()));
 	let minDate = $state(isoDate(new Date()));
 	let maxDate = $state(isoDate(addDays(new Date(), DATE_WINDOW_DAYS)));
 	let serviceDays = $state<DayType[]>([dayTypeOf(new Date())]);
 	let delaysReady = $state(false);
-	let delayInfo = $state(TAGLINE);
+	let loadError = $state('');
+	let recents = $state<RecentStation[]>([]);
 	let statusMsg = $state('');
 	let statusError = $state(false);
 	let busy = $state(false);
-	let selectResults = $state<DepartureDto[]>([]);
-	let selectTime = $state('');
 	let listResults = $state<DepartureDto[]>([]);
 	// Where the shown page begins and ends, in minutes: the anchors the next
 	// "Früher"/"Später" pages off. Clock strings can't serve, they wrap at 24:00.
@@ -72,6 +77,9 @@
 	let listLatest = $state<number | null>(null);
 	// Paging can walk off the queried date, so the shown page carries its own.
 	let listDate = $state<string | null>(null);
+	// The minute of the first departure the query found, marked on the board
+	// until a result has been opened.
+	let nextMinutes = $state<number | null>(null);
 	let result = $state<DepartureDto | null>(null);
 	let resultDayType = $state<DayType | null>(null);
 	let queryMeta = $state<QueryMeta | null>(null);
@@ -90,6 +98,13 @@
 		const day = parseIsoDate(iso);
 		if (day.getDay() !== 0 && isHoliday(day)) return `Feiertag, ${DAY_MONTH_FORMAT.format(day)}`;
 		return DATE_FORMAT.format(day);
+	}
+
+	/** "Di 22.09." */
+	function shortDate(iso: string) {
+		const day = parseIsoDate(iso);
+		const weekday = WEEKDAY_SHORT_FORMAT.format(day).replace(/\.$/, '');
+		return `${weekday} ${DAY_MONTH_FORMAT.format(day)}`;
 	}
 
 	function dayTypeOfMeta(meta: QueryMeta): DayType {
@@ -145,6 +160,16 @@
 		refreshDateWindow();
 	}
 
+	/** In "Jetzt" mode, moves time and date along with the clock. */
+	function syncNow() {
+		if (when === 'now') resetDefaults();
+	}
+
+	function setWhen(next: 'now' | 'later') {
+		when = next;
+		syncNow();
+	}
+
 	function fmtDuration(abs: number) {
 		const m = Math.floor(abs / 60);
 		const s = abs % 60;
@@ -153,63 +178,98 @@
 		return `${s} Sek`;
 	}
 
-	function prettyMode(mode: string) {
-		const map: Record<string, string> = {
-			RAIL: 'Zug',
-			BUS: 'Bus',
-			TRAM: 'Tram',
-			SUBWAY: 'Metro',
-			FERRY: 'Fähre',
-			FUNICULAR: 'Standseilbahn',
-			CABLE_TRAM: 'Seilbahn',
-			AERIAL_LIFT: 'Seilbahn',
-			TROLLEYBUS: 'Trolleybus',
-			MONORAIL: 'Einschienenbahn'
-		};
-		return map[mode] ?? mode ?? '';
+	/** "40 s", "1:10" - with a sign when `signed`, as delays on the board carry one. */
+	function fmtSeconds(seconds: number, signed = false) {
+		const abs = Math.abs(seconds);
+		const sign = seconds < 0 ? '−' : signed && seconds > 0 ? '+' : '';
+		const mag = abs < 60 ? `${abs} s` : `${Math.floor(abs / 60)}:${pad2(abs % 60)}`;
+		return sign + mag;
 	}
 
 	/** The modes that run on rails, and so stop at a Gleis rather than a Kante. */
 	const TRACK_MODES = new Set(['RAIL', 'SUBWAY', 'FUNICULAR']);
 
-	function platformLabel(mode: string, platform: string | null) {
-		return platform ? ` · ${TRACK_MODES.has(mode) ? 'Gleis' : 'Kante'} ${platform}` : '';
+	function platformWord(mode: string) {
+		return TRACK_MODES.has(mode) ? 'Gleis' : 'Kante';
+	}
+
+	/** Whether another departure on the page leaves in the same minute. */
+	function sharesMinute(items: DepartureDto[], dto: DepartureDto) {
+		return items.some((r) => r !== dto && r.plannedDepartureMinutes === dto.plannedDepartureMinutes);
 	}
 
 	/**
-	 * The result hero: how late this departure runs on average, with the buffer
-	 * you actually plan around - how late *you* can be - spelled out below it.
+	 * The result headline: the latest you can be at the platform, as a clock
+	 * time - the planned departure plus the buffer that still catches it in
+	 * 9 of 10 cases.
 	 */
 	function heroInfo(dto: DepartureDto) {
-		const avg = dto.departure.delaySeconds;
 		const buffer = dto.departure.catchBufferSeconds;
-		// The number is the average, coloured by what it means for you: a departure
-		// that runs late buys you time, one that runs early costs you some.
-		const cls = avg == null || avg === 0 ? 'neutral' : avg > 0 ? 'good' : 'bad';
-		const note =
-			buffer == null
-				? delaysReady
+		if (buffer == null) {
+			return {
+				clock: null,
+				note: delaysReady
 					? 'Für diese Verbindung liegen keine Verspätungsdaten vor.'
 					: 'Für diesen Fahrplan liegen keine Verspätungsdaten vor.'
-				: buffer > 0
-					? `Komm weniger als ${fmtDuration(buffer)} zu spät, dann klappt es in 9 von 10 Fällen.`
-					: buffer < 0
-						? `Sei ${fmtDuration(-buffer)} vor der planmässigen Zeit da, dann klappt es in 9 von 10 Fällen.`
-						: 'Sei pünktlich da, dann klappt es in 9 von 10 Fällen.';
-		if (avg == null) {
-			return { cls, num: '—', label: 'Keine Prognose möglich', note };
-		}
-		// The label above the number says which way it goes, so the number itself
-		// carries no sign - and "0 Sek" reads as a Verspätung like any other.
-		if (avg < 0) {
-			return {
-				cls,
-				num: fmtDuration(-avg),
-				label: 'Diese Verbindung fährt durchschnittlich zu früh:',
-				note
 			};
 		}
-		return { cls, num: fmtDuration(avg), label: 'Die durchschnittliche Verspätung beträgt:', note };
+		const planned = (dto.plannedDepartureMinutes % MINUTES_PER_DAY) * 60;
+		return {
+			clock: secondsToClock(planned + buffer),
+			note:
+				buffer < 0
+					? `Das ist ${fmtDuration(-buffer)} vor der Planzeit – dann erwischst du den Zug in`
+					: 'Dann erwischst du den Zug in'
+		};
+	}
+
+	/** Labels closer than this (in % of the track) would overlap. */
+	const LABEL_GAP = 10;
+
+	/**
+	 * The timeline under the headline: seconds after the planned departure,
+	 * 0-60 unless the buffer or the average reach past either end, with a
+	 * marker for each. Positions are percentages of the track.
+	 */
+	function timeline(dto: DepartureDto) {
+		const avg = dto.departure.delaySeconds;
+		const buffer = dto.departure.catchBufferSeconds;
+		const values = [avg, buffer].filter((v): v is number => v != null);
+		if (!values.length) return null;
+		const lo = Math.min(0, ...values.map((v) => Math.floor(v / 30) * 30));
+		const hi = Math.max(60, ...values.map((v) => Math.ceil(v / 30) * 30));
+		const pos = (s: number) => ((s - lo) / (hi - lo)) * 100;
+		const bufferPos = buffer == null ? null : pos(buffer);
+		const avgPos = avg == null ? null : pos(avg);
+		const markers = [bufferPos, avgPos].filter((p): p is number => p != null);
+		const clear = (p: number) => markers.every((m) => Math.abs(m - p) >= LABEL_GAP);
+		const zero = pos(0);
+		return {
+			lo,
+			hi,
+			zero,
+			buffer,
+			bufferPos,
+			avg,
+			avgPos,
+			showLo: clear(0),
+			showHi: clear(100),
+			showAvgTop: avgPos != null && (bufferPos == null || Math.abs(avgPos - bufferPos) >= LABEL_GAP),
+			// "Fahrplan" and "Ø Abfahrt" are words, so they need more room than a number.
+			showAvgBottom: avgPos != null && Math.abs(avgPos - zero) >= 2 * LABEL_GAP
+		};
+	}
+
+	/** ":09" within the first minute, "1:30" / "−0:20" beyond it. */
+	function tickLabel(s: number) {
+		if (s >= 0 && s <= 60) return `:${pad2(s)}`;
+		const abs = Math.abs(s);
+		return `${s < 0 ? '−' : ''}${Math.floor(abs / 60)}:${pad2(abs % 60)}`;
+	}
+
+	/** Keeps a label inside the track: flush left or right near the ends, centred elsewhere. */
+	function anchor(p: number) {
+		return p < 8 ? 'start' : p > 92 ? 'end' : 'mid';
 	}
 
 	function buildShareUrl(dto: DepartureDto, meta: QueryMeta): URL {
@@ -240,6 +300,8 @@
 	async function runSearch(meta: QueryMeta, pick?: { line: string; dest: string | null }) {
 		busy = true;
 		listDate = null;
+		nextMinutes = null;
+		result = null;
 		const metaDayType = dayTypeOfMeta(meta);
 		// The first lookup of a day type pulls in its timetable (a few MB), which
 		// takes noticeably longer than the search itself — say so. In the small
@@ -271,7 +333,7 @@
 			rememberStation({ id: stopId, name: data.query.from.name });
 			// A shared link should carry that same id rather than the typed name,
 			// which can rank onto a different station once the feed changes.
-			meta = { ...meta, stationId: stopId };
+			meta = { ...meta, stationId: stopId, stationName: data.query.from.name };
 			resultDayType = data.dayType;
 			const preselected = pick
 				? data.results.find(
@@ -281,14 +343,12 @@
 				: undefined;
 			if (preselected) {
 				showResult(preselected, meta, data.dayType);
-			} else if (data.results.length === 1) {
-				showResult(data.results[0], meta, data.dayType);
-			} else {
-				selectResults = data.results;
-				selectTime = data.nextDepartureTime ?? meta.time;
-				queryMeta = meta;
-				screen = 'select';
+				return;
 			}
+			// The board opens on the next departure, with a few either side of it.
+			queryMeta = meta;
+			nextMinutes = data.results[0].plannedDepartureMinutes;
+			await showPage('around', nextMinutes, AROUND_SIZE, meta.date);
 		} catch (err) {
 			statusMsg =
 				err instanceof TransitError
@@ -302,15 +362,13 @@
 
 	/** The minutes the shown departures span, whichever screen is showing them. */
 	function shownWindow(): { earliest: number; latest: number; date: string } | null {
-		if (screen === 'list' && listEarliest != null && listLatest != null && listDate) {
+		if (screen === 'board' && listEarliest != null && listLatest != null && listDate) {
 			return { earliest: listEarliest, latest: listLatest, date: listDate };
 		}
-		const single =
-			screen === 'result' ? result : screen === 'select' ? selectResults[0] : null;
-		if (!single || !queryMeta) return null;
+		if (screen !== 'result' || !result || !queryMeta) return null;
 		return {
-			earliest: single.plannedDepartureMinutes,
-			latest: single.plannedDepartureMinutes,
+			earliest: result.plannedDepartureMinutes,
+			latest: result.plannedDepartureMinutes,
 			date: queryMeta.date
 		};
 	}
@@ -374,7 +432,7 @@
 			listLatest = data.latest;
 			listDate = useDate;
 			resultDayType = data.dayType;
-			screen = 'list';
+			screen = 'board';
 		} catch (err) {
 			statusMsg =
 				err instanceof TransitError
@@ -404,28 +462,34 @@
 	}
 
 	/**
-	 * Whether a listed departure is the one the result screen is showing, so a
-	 * page of alternatives points out where you currently are in it.
+	 * Whether a listed departure is the one the result screen was showing, so the
+	 * board points out where you currently are in it.
 	 */
 	function isCurrent(dto: DepartureDto) {
 		return (
 			result != null &&
 			// After a roll the page is a different date, where the same minute is
 			// a different departure.
-			(screen !== 'list' || listDate === queryMeta?.date) &&
+			listDate === queryMeta?.date &&
 			dto.plannedDepartureMinutes === result.plannedDepartureMinutes &&
 			dto.line === result.line &&
 			(dto.destination?.id ?? null) === (result.destination?.id ?? null)
 		);
 	}
 
-	function pick(dto: DepartureDto, paged: boolean) {
+	/** Whether a listed departure is the next one the search found, before any was picked. */
+	function isNext(dto: DepartureDto) {
+		return (
+			result == null &&
+			nextMinutes != null &&
+			listDate === queryMeta?.date &&
+			dto.plannedDepartureMinutes === nextMinutes
+		);
+	}
+
+	function pick(dto: DepartureDto) {
 		const meta = queryMeta as QueryMeta;
-		if (!paged) {
-			showResult(dto, meta, resultDayType);
-			return;
-		}
-		// A departure picked off a page is no longer the one the original query
+		// A departure picked off the board is no longer the one the original query
 		// asked for, so the shared link has to point at its own date and time -
 		// and one past 24:00 belongs to the next date, counted from its midnight
 		// so that paging on from here anchors in the same day the result names.
@@ -448,8 +512,8 @@
 		}
 	}
 
-	function submit(e: SubmitEvent) {
-		e.preventDefault();
+	function search() {
+		syncNow();
 		const id = stationId ?? stationName.trim();
 		if (!id) {
 			statusMsg = 'Bitte gib einen Abfahrtsort ein.';
@@ -469,20 +533,33 @@
 		runSearch({ stationId: id, stationName, time, date });
 	}
 
+	function submit(e: SubmitEvent) {
+		e.preventDefault();
+		search();
+	}
+
+	function pickRecent(r: RecentStation) {
+		stationName = r.name;
+		stationId = r.id;
+		search();
+	}
+
 	function goAgain() {
 		replaceState(location.pathname, {});
 		result = null;
-		selectResults = [];
 		listResults = [];
 		listEarliest = null;
 		listLatest = null;
 		listDate = null;
+		nextMinutes = null;
 		queryMeta = null;
 		statusMsg = '';
+		recents = recentStations().slice(0, RECENT_CHIPS);
 		// Keep the station and the date as they were; only the time needs to
-		// move forward so "Nochmal" reflects the moment you're clicking it.
+		// move forward so a new search reflects the moment you're clicking it.
 		updateTimeToNow();
 		refreshDateWindow();
+		syncNow();
 		screen = 'form';
 	}
 
@@ -516,7 +593,14 @@
 		planner.preload(dayTypeOf(day), needsPreviousDay(time) ? dayTypeOf(addDays(day, -1)) : null);
 	});
 
+	// Each screen starts at its top, wherever the last one was scrolled to.
+	$effect(() => {
+		void screen;
+		window.scrollTo({ top: 0 });
+	});
+
 	onMount(() => {
+		recents = recentStations().slice(0, RECENT_CHIPS);
 		(async () => {
 			// Start pulling the stops index in while the form is being filled in.
 			planner.prewarm();
@@ -526,7 +610,7 @@
 				serviceDays = meta.serviceDays?.length ? meta.serviceDays : [dayTypeOf(new Date())];
 			} catch {
 				serviceDays = [dayTypeOf(new Date())];
-				delayInfo = 'Die Fahrplandaten konnten nicht geladen werden.';
+				loadError = 'Die Fahrplandaten konnten nicht geladen werden.';
 			}
 			resetDefaults();
 
@@ -540,6 +624,7 @@
 				time: params.get('time') || time,
 				date: linkDate(params.get('date'), params.get('dayType'))
 			};
+			when = 'later';
 			stationId = meta.stationId;
 			stationName = meta.stationName;
 			time = meta.time;
@@ -547,6 +632,12 @@
 			const line = params.get('line');
 			runSearch(meta, line ? { line, dest: params.get('dest') } : undefined);
 		})();
+
+		// "Jetzt" shows the current time, so it has to keep up with the clock.
+		const tick = setInterval(() => {
+			if (screen === 'form') syncNow();
+		}, 15_000);
+		return () => clearInterval(tick);
 	});
 </script>
 
@@ -554,134 +645,237 @@
 	<title>Wie spät ist zu spät?</title>
 </svelte:head>
 
-<main>
-	<header>
-		<h1>⏱️ Wie spät ist zu spät?</h1>
-		<p class="sub">{delayInfo}</p>
-	</header>
-
+{#snippet status()}
 	{#if statusMsg}
-		<div class="status" class:error={statusError}>{statusMsg}</div>
+		<p class="status" class:error={statusError} role="status">{statusMsg}</p>
 	{/if}
+{/snippet}
 
+{#snippet lineBadge(line: string)}
+	<span class="line-badge">{line}</span>
+{/snippet}
+
+<main class="screen-{screen}">
 	{#if screen === 'form'}
-		<form class="card" onsubmit={submit}>
+		<header class="intro">
+			<h1>Wie spät ist zu spät?</h1>
+		</header>
+
+		<form class="search" onsubmit={submit}>
 			<StationAutocomplete bind:value={stationName} bind:stationId />
-			<div class="field">
-				<label for="time">Abfahrtszeit</label>
-				<input type="time" id="time" bind:value={time} />
-			</div>
-			<div class="field">
-				<label for="date">Datum</label>
-				<input
-					type="date"
-					id="date"
-					bind:value={date}
-					min={minDate}
-					max={maxDate}
-					onclick={openPicker}
-				/>
-				{#if selectedHoliday}
-					<p class="sub">{selectedHoliday} — es gilt der Sonntagsfahrplan.</p>
-				{:else if dayUnavailable}
-					<p class="sub">Für {DAY_TYPE_LABELS[dayType]} liegen keine Fahrplandaten vor.</p>
+
+			<div class="when">
+				<div class="segmented" role="group" aria-label="Abfahrtszeit">
+					<button type="button" aria-pressed={when === 'now'} onclick={() => setWhen('now')}>
+						Jetzt
+					</button>
+					<button type="button" aria-pressed={when === 'later'} onclick={() => setWhen('later')}>
+						Später
+					</button>
+				</div>
+				{#if when === 'now'}
+					<span class="when-now">{time} · {shortDate(date)}</span>
 				{/if}
 			</div>
-			<button class="go" type="submit" disabled={busy}>Berechnen</button>
+
+			{#if when === 'later'}
+				<div class="when-fields">
+					<div class="field">
+						<label for="time">Zeit</label>
+						<input type="time" id="time" bind:value={time} />
+					</div>
+					<div class="field">
+						<label for="date">Datum</label>
+						<input
+							type="date"
+							id="date"
+							bind:value={date}
+							min={minDate}
+							max={maxDate}
+							onclick={openPicker}
+						/>
+					</div>
+				</div>
+			{/if}
+			{#if selectedHoliday}
+				<p class="hint">{selectedHoliday} — es gilt der Sonntagsfahrplan.</p>
+			{:else if dayUnavailable}
+				<p class="hint">Für {DAY_TYPE_LABELS[dayType]} liegen keine Fahrplandaten vor.</p>
+			{/if}
+
+			<button class="btn btn-accent" type="submit" disabled={busy}>Abfahrten zeigen</button>
+			{@render status()}
+			{#if loadError}
+				<p class="status error">{loadError}</p>
+			{/if}
 		</form>
+
+		{#if recents.length}
+			<section class="recents" aria-labelledby="recents-title">
+				<h2 id="recents-title" class="label">Zuletzt</h2>
+				<div class="chips">
+					{#each recents as r (r.id)}
+						<button type="button" class="chip" onclick={() => pickRecent(r)} disabled={busy}>
+							{r.name}
+						</button>
+					{/each}
+				</div>
+			</section>
+		{/if}
 	{/if}
 
-	{#snippet departureList(items: DepartureDto[], paged: boolean)}
-		<div class="select-list">
-			{#each items as r (r.plannedDepartureMinutes + ':' + r.line + ':' + (r.destination?.id ?? ''))}
+	{#if screen === 'board' && listResults.length}
+		<header class="board-head">
+			<button type="button" class="back" onclick={goAgain}>← Neue Suche</button>
+			<div class="board-title">
+				<h1>{queryMeta?.stationName || 'Abfahrten'}</h1>
+				{#if queryMeta}<span class="board-clock">{queryMeta.time}</span>{/if}
+			</div>
+			<p class="board-sub">
+				{#if listDate}{shortDate(listDate)} · {/if}Tippe deinen Zug an
+			</p>
+		</header>
+		{@render status()}
+
+		<div class="board">
+			<div class="board-row board-columns" aria-hidden="true">
+				<span>Zeit</span>
+				<span>Nach</span>
+				<span class="platform-col">
+					{listResults.some((r) => TRACK_MODES.has(r.mode)) ? 'Gleis' : 'Kante'}
+				</span>
+			</div>
+			<button class="pager" type="button" onclick={goEarlier} disabled={busy}>↑ Früher</button>
+			{#each listResults as r (r.plannedDepartureMinutes + ':' + r.line + ':' + (r.destination?.id ?? ''))}
 				{@const current = isCurrent(r)}
+				{@const delay = r.departure.delaySeconds}
 				<button
 					type="button"
-					class="select-item"
-					class:current
+					class="board-row departure"
+					class:selected={current || isNext(r)}
 					aria-current={current ? 'true' : undefined}
-					onclick={() => pick(r, paged)}
+					onclick={() => pick(r)}
 				>
-					{#if paged}
-						<span class="select-time">{r.plannedDeparture}</span>
-					{/if}
-					<span class="badge mode-{r.mode || 'OTHER'}">{r.line}</span>
-					<span class="select-body">
-						<span class="select-dest">→ {r.destination?.name ?? '?'}</span>
-						<span class="select-meta">{prettyMode(r.mode)}{platformLabel(r.mode, r.from.platform)}</span>
+					<span class="dep-time">
+						<span class="clock">{r.plannedDeparture}</span>
+						{#if delay != null}<span class="delay">{fmtSeconds(delay, true)}</span>{/if}
+					</span>
+					<span class="dep-body">
+						<span class="dep-line">
+							{@render lineBadge(r.line)}
+							<span class="dest">{r.destination?.name ?? '?'}</span>
+						</span>
+						<span class="dep-meta">
+							{delay != null ? 'Ø Verspätung' : 'Keine Verspätungsdaten'}{#if sharesMinute(listResults, r)}&nbsp;· gleiche Zeit{/if}
+						</span>
+					</span>
+					<span class="platform">
+						{#if r.from.platform}<span class="sr-only">{platformWord(r.mode)} </span>{r.from.platform}{/if}
 					</span>
 				</button>
 			{/each}
-		</div>
-	{/snippet}
-
-	{#snippet alternativesButton()}
-		<button class="pager" type="button" onclick={showAlternatives} disabled={busy}>
-			Alternative Verbindungen
-		</button>
-	{/snippet}
-
-	{#if screen === 'select'}
-		<div class="card">
-			<h2>Mehrere Abfahrten um {selectTime} Uhr</h2>
-			<p class="sub">Welche Verbindung nimmst du?</p>
-			{@render departureList(selectResults, false)}
-			{@render alternativesButton()}
-		</div>
-	{/if}
-
-	{#if screen === 'list' && listResults.length}
-		<div class="card">
-			<h2>Verbindungen ab {queryMeta?.stationName || 'der Haltestelle'}</h2>
-			<p class="sub">
-				{listResults[0].plannedDeparture} – {listResults[listResults.length - 1]
-					.plannedDeparture} Uhr{#if listDate ?? queryMeta?.date}, {formatDate(
-						(listDate ?? queryMeta?.date) as string
-					)}{:else if resultDayType}, {DAY_TYPE_LABELS[resultDayType]}{/if}
-			</p>
-			<button class="pager" type="button" onclick={goEarlier} disabled={busy}>↑ Früher</button>
-			{@render departureList(listResults, true)}
 			<button class="pager" type="button" onclick={goLater} disabled={busy}>↓ Später</button>
 		</div>
 	{/if}
 
 	{#if screen === 'result' && result}
-		{@const b = heroInfo(result)}
-		<div class="card">
-			<div class="hero">
-				<div class="hero-label">{b.label}</div>
-				<div class="hero-num {b.cls}">{b.num}</div>
-				<div class="hero-note">{b.note}</div>
-			</div>
-			<div class="detail">
-				<span class="badge mode-{result.mode || 'OTHER'}">{result.line}</span>
-				<span class="detail-body">
-					<span class="detail-dest">{result.plannedDeparture} → {result.destination?.name ?? '?'}</span>
-					<span class="detail-meta">
-						{prettyMode(result.mode)}{platformLabel(result.mode, result.from.platform)}
-						{#if queryMeta}
-							· {formatDate(queryMeta.date)}
-						{:else if resultDayType}
-							· {DAY_TYPE_LABELS[resultDayType]}
+		{@const hero = heroInfo(result)}
+		{@const tl = timeline(result)}
+		<h1 class="sr-only">Wie spät ist zu spät?</h1>
+		<button type="button" class="back" onclick={showAlternatives} disabled={busy}>
+			← Andere Abfahrt
+		</button>
+		{@render status()}
+
+		<div class="board-row departure-card">
+			<span class="clock">{result.plannedDeparture}</span>
+			<span class="dep-body">
+				<span class="dep-line">
+					{@render lineBadge(result.line)}
+					<span class="dest">{result.destination?.name ?? '?'}</span>
+				</span>
+				<span class="dep-meta">
+					{#if queryMeta}ab {queryMeta.stationName} · {shortDate(queryMeta.date)}{:else if resultDayType}{DAY_TYPE_LABELS[resultDayType]}{/if}
+				</span>
+			</span>
+			<span class="platform">
+				{#if result.from.platform}<span class="sr-only">{platformWord(result.mode)} </span>{result.from.platform}{/if}
+			</span>
+		</div>
+
+		<section class="verdict">
+			{#if hero.clock}
+				<p class="verdict-label">Spätestens am Gleis</p>
+				<p class="verdict-clock">{hero.clock}</p>
+				<p class="verdict-note">{hero.note} <strong>9 von 10</strong> Fällen.</p>
+			{:else}
+				<p class="verdict-label">Keine Prognose möglich</p>
+				<p class="verdict-note">{hero.note}</p>
+			{/if}
+
+			{#if tl}
+				<div class="timeline" aria-hidden="true">
+					<div class="tl-track"></div>
+					{#if tl.bufferPos != null}
+						<div
+							class="tl-fill"
+							style:left="{Math.min(tl.zero, tl.bufferPos)}%"
+							style:width="{Math.abs(tl.bufferPos - tl.zero)}%"
+						></div>
+					{/if}
+					{#if tl.showLo}<span class="tl-label tl-top anchor-start" style:left="0%">{tickLabel(tl.lo)}</span>{/if}
+					{#if tl.showHi}<span class="tl-label tl-top anchor-end" style:left="100%">{tickLabel(tl.hi)}</span>{/if}
+					{#if tl.bufferPos != null && tl.buffer != null}
+						<span class="tl-label tl-top tl-buffer anchor-{anchor(tl.bufferPos)}" style:left="{tl.bufferPos}%">
+							{tickLabel(tl.buffer)}
+						</span>
+						<span class="tl-tick tl-buffer" style:left="{tl.bufferPos}%"></span>
+					{/if}
+					{#if tl.avgPos != null && tl.avg != null}
+						{#if tl.showAvgTop}
+							<span class="tl-label tl-top tl-avg anchor-{anchor(tl.avgPos)}" style:left="{tl.avgPos}%">
+								{tickLabel(tl.avg)}
+							</span>
 						{/if}
-					</span>
+						<span class="tl-tick tl-avg" style:left="{tl.avgPos}%"></span>
+						{#if tl.showAvgBottom}
+							<span class="tl-label tl-bottom anchor-{anchor(tl.avgPos)}" style:left="{tl.avgPos}%">Ø Abfahrt</span>
+						{/if}
+					{/if}
+					<span class="tl-label tl-bottom anchor-{anchor(tl.zero)}" style:left="{tl.zero}%">Fahrplan</span>
+				</div>
+			{/if}
+		</section>
+
+		<div class="stats">
+			<div class="stat">
+				<span class="stat-label">Ø Verspätung</span>
+				<span class="stat-value accent">
+					{result.departure.delaySeconds != null ? fmtSeconds(result.departure.delaySeconds, true) : '—'}
 				</span>
 			</div>
-			{@render alternativesButton()}
-			<div class="actions">
-				<button class="secondary" type="button" onclick={share}>Teilen</button>
-				<button class="go" type="button" onclick={goAgain}>Nochmal</button>
+			<div class="stat">
+				<span class="stat-label">Sicherer Puffer</span>
+				<span class="stat-value">
+					{result.departure.catchBufferSeconds != null
+						? fmtSeconds(result.departure.catchBufferSeconds)
+						: '—'}
+				</span>
 			</div>
+		</div>
+
+		<div class="actions">
+			<button class="btn btn-outline" type="button" onclick={share}>Teilen</button>
+			<button class="btn btn-light" type="button" onclick={goAgain}>Neue Suche</button>
 		</div>
 	{/if}
 
 	<footer>
 		Erstellt von
 		<a href="https://jelle.schutter.xyz" target="_blank" rel="noopener noreferrer">Jelle Schutter</a>
-		mit Daten von
+		· Daten:
 		<a href="https://opentransportdata.swiss" target="_blank" rel="noopener noreferrer">opentransportdata.swiss</a>
-		❤️
 	</footer>
 </main>
 
-<div class="toast" class:show={toastVisible}>{toastMsg}</div>
+<div class="toast" class:show={toastVisible} role="status">{toastMsg}</div>
