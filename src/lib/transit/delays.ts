@@ -25,15 +25,43 @@ import type { DayType } from './time';
 //
 // Rows are sorted by (line index, planned minute) and deduplicated, so a
 // station's block can be binary-searched for an exact match.
+//
+// Besides one shard set per weekday there is one per pool of weekdays
+// (`DelayGroup`): the same statistics over Mo-Fr, the weekend or every day,
+// computed from the raw observations - a percentile can't be merged from the
+// weekdays' own afterwards. Bundles built before the pools existed lack them.
 // ---------------------------------------------------------------------------
 
 const FORMAT_VERSION = 2;
 const ROW_SIZE = 10;
 const MINUTES_PER_DAY = 1440;
 
+/** Pools of weekdays with their own shards. Keep in sync with DELAY_GROUPS in pipeline/layout.js. */
+export type DelayGroup = 'weekdays' | 'weekend' | 'all';
+
+/** A set of shards: one weekday's, or one pool's. */
+export type DelaySet = DayType | DelayGroup;
+
+/**
+ * Which days a departure's statistics are drawn from, relative to its own
+ * service day: just that weekday, its pool (Mo-Fr or the weekend), or all days.
+ */
+export type DelayScope = 'day' | 'group' | 'all';
+
+export const DELAY_SCOPES: readonly DelayScope[] = ['day', 'group', 'all'];
+
+/** The shard set a scope reads for a departure of this service day. */
+export function delaySetOf(scope: DelayScope, dayType: DayType): DelaySet {
+	if (scope === 'day') return dayType;
+	if (scope === 'all') return 'all';
+	return dayType === 'saturday' || dayType === 'sunday' ? 'weekend' : 'weekdays';
+}
+
 export type DelaysMeta = {
 	dayTypes: DayType[];
-	days: Partial<Record<DayType, number>>;
+	/** Absent from bundles built before the pools existed. */
+	groups?: DelayGroup[];
+	days: Partial<Record<DelaySet, number>>;
 	buckets: number;
 	stations: number;
 };
@@ -241,9 +269,17 @@ export class DelayIndex {
 		return this.meta.dayTypes;
 	}
 
-	/** Number of days that contributed to a day type. */
-	daysFor(dayType: DayType): number {
-		return this.meta.days[dayType] ?? 0;
+	/** Number of days that contributed to a day type or pool. */
+	daysFor(set: DelaySet): number {
+		return this.meta.days[set] ?? 0;
+	}
+
+	/** Whether the bundle carries shards for a day type or pool. */
+	has(set: DelaySet): boolean {
+		return (
+			this.dayTypes.includes(set as DayType) ||
+			(this.meta.groups ?? []).includes(set as DelayGroup)
+		);
 	}
 
 	/** Resolves a requested day type to one that has data. */
@@ -254,10 +290,10 @@ export class DelayIndex {
 		return types[0];
 	}
 
-	/** Loads (and caches) the delay rows of one station (by BPUIC) for one day type. */
-	async forStation(dayType: DayType, bpuic: number): Promise<StationDelays | null> {
-		if (!this.dayTypes.includes(dayType)) return null;
-		const path = `delays/${dayType}/${bpuic % this.meta.buckets}.bin.gz`;
+	/** Loads (and caches) the delay rows of one station (by BPUIC) for one day type or pool. */
+	async forStation(set: DelaySet, bpuic: number): Promise<StationDelays | null> {
+		if (!this.has(set)) return null;
+		const path = `delays/${set}/${bpuic % this.meta.buckets}.bin.gz`;
 		let shard = this.shards.get(path);
 		if (!shard) {
 			shard = fetchBinary(path, { optional: true }).then(parseShard);

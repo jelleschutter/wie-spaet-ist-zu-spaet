@@ -26,7 +26,7 @@ Drei Schritte, jeder einzeln aufrufbar (`--only`) und jeder fortsetzbar:
 | --- | --- | --- | --- |
 | `download` | [geops GTFS](https://gtfs.geops.ch/dl/gtfs_complete.zip) (165 MB) und 12 Monats­archive [Ist-Daten](https://archive.opentransportdata.swiss/istdaten/) (je ~1.3 GB) | `data/raw/` | ~10 min |
 | `timetables` | GTFS | `stops.bin.gz` + 7× `timetable.<wochentag>.bin.gz` + 7× `tail.<wochentag>.bin.gz` | ~9 min pro Wochentag |
-| `delays` | Ist-Daten | `delays/<wochentag>/<n>.bin.gz` | ~2 s pro Kalendertag, 12 Monate in ~18 min |
+| `delays` | Ist-Daten | `delays/<wochentag \| gruppe>/<n>.bin.gz` | ~2 s pro Kalendertag, 12 Monate in ~18 min |
 
 Nützliche Flags: `--days 3` (nur drei Ist-Daten-Tage, für einen schnellen
 Durchlauf), `--months 1`, `--only delays`, `--force`, `--today 2026-08-17`,
@@ -109,7 +109,23 @@ braucht es pro geplanter Abfahrt aber nur sechs Zahlen. Deshalb:
 3. jede Zeile wird zu **10 Bytes** und nach Haltestelle in 1024 Shards pro
    Wochentag gruppiert, gzip-komprimiert.
 
-Ergebnis: eine Abfrage lädt genau einen Shard (~20 KB) statt des Datensatzes.
+Ergebnis: eine Abfrage lädt pro Auswertung einen Shard (~20 KB) statt des Datensatzes.
+
+### Gruppen: Mo–Fr, Wochenende, alle Tage
+
+Neben dem einzelnen Wochentag kann man in der App wählen, aus welchen Tagen die
+Zahlen stammen: dem gleichen Wochentag („Montags“), Mo–Fr bzw. dem Wochenende
+(Sa, So und Feiertage) oder allen Tagen. Standard ist Mo–Fr bzw. das
+Wochenende — ein Vielfaches an Messungen für Kurse, die die ganze Woche gleich
+fahren. Ein Perzentil lässt sich nicht aus den Werten der einzelnen Wochentage
+zusammensetzen, deshalb aggregiert Schritt 2 jede Gruppe noch einmal aus den
+Tagesdateien und schreibt sie wie einen Wochentag nach `delays/weekdays/`,
+`delays/weekend/` und `delays/all/`. Eine Gruppe läuft in `--chunks` Durchgängen
+pro enthaltenem Wochentag, braucht also nicht mehr Speicher als ein einzelner
+Wochentag, nur mehr Zeit. Der Browser lädt alle drei Shards einer Haltestelle
+auf einmal, der Wechsel zwischen den Auswertungen braucht dann keine neue
+Abfrage. Ein Bündel ohne Gruppen (älter als dieser Schritt) funktioniert
+weiterhin; die Auswahl fehlt dann einfach.
 
 Der **Verspätungspuffer** ist der grösste Wert B, bei dem der Kurs an mindestens
 90 % der gemessenen Tage um B oder mehr verspätet abgefahren ist — komm B
@@ -168,6 +184,7 @@ static/data/              ausgeliefertes Bündel (nicht im Git, 215 MB, 7184 Dat
   timetable.<tag>.bin.gz  5.4 MB (So) bis 8.5 MB (Fr), zusammen 54 MB
   tail.<tag>.bin.gz       Kurse nach Mitternacht, 0.2 MB bis 0.4 MB (Fr, Sa)
   delays/<tag>/<n>.bin.gz 1024 Shards pro Wochentag, zusammen 158 MB
+  delays/<gruppe>/…       dasselbe für weekdays, weekend und all
   meta.json               Wochentage, Abdeckung, globale Linientabelle
 
 src/lib/transit/          die Logik, die früher auf dem Server lief
