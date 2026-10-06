@@ -9,7 +9,8 @@
  *   1. download    the geops GTFS feed and the last 12 monthly Ist-Daten archives
  *   2. timetables  one minotor timetable per weekday and its trips past midnight,
  *                  plus the stops index
- *   3. delays      per-station delay statistics, sharded per weekday
+ *   3. delays      per-station delay statistics, sharded per weekday and per
+ *                  pool of weekdays (Mo-Fr, weekend, all)
  *
  * Nothing else runs before deployment: `npm run build` only bundles the frontend
  * around the files this produces.
@@ -36,6 +37,7 @@ import {
 	AGG_CHUNKS,
 	BUCKETS,
 	DAY_TYPES,
+	DELAY_GROUPS,
 	FORMAT_VERSION,
 	GTFS_ZIP,
 	OUT_DIR,
@@ -229,15 +231,19 @@ async function main() {
 			chunks: args.chunks
 		});
 
+		const dayCount = (dayTypes) =>
+			dayTypes.reduce((total, dayType) => total + days[dayType].length, 0);
 		meta.lines = lineTable;
 		meta.delays = {
 			dayTypes: summary.dayTypes,
-			days: Object.fromEntries(
-				DAY_TYPES.filter((dayType) => days[dayType].length > 0).map((dayType) => [
+			groups: summary.groups,
+			days: Object.fromEntries([
+				...DAY_TYPES.filter((dayType) => days[dayType].length > 0).map((dayType) => [
 					dayType,
 					days[dayType].length
-				])
-			),
+				]),
+				...summary.groups.map((group) => [group, dayCount(DELAY_GROUPS[group])])
+			]),
 			buckets: BUCKETS,
 			stations: summary.stations,
 			minSamples: args.minSamples
@@ -272,6 +278,7 @@ async function main() {
 	}
 	log(`  service days: ${serviceDays.join(', ') || '-'}`);
 	log(`  delay day types: ${(merged.delays?.dayTypes ?? []).join(', ') || '-'}`);
+	log(`  delay groups: ${(merged.delays?.groups ?? []).join(', ') || '-'}`);
 	log(
 		`\nDone in ${duration((performance.now() - started) / 1000)}: ` +
 			`${mb(totalBytes)} in ${num(totalFiles)} files under static/data/`

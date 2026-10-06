@@ -3,6 +3,7 @@
 	import { replaceState } from '$app/navigation';
 	import StationAutocomplete from '$lib/components/StationAutocomplete.svelte';
 	import { recentStations, rememberStation, type RecentStation } from '$lib/recentStations';
+	import { saveDelayScope, savedDelayScope } from '$lib/delayScope';
 	import {
 		addDays,
 		dayTypeOf,
@@ -15,7 +16,9 @@
 		secondsToClock,
 		TransitError,
 		type DayType,
+		type DelayScope,
 		type DepartureDto,
+		type DepartureEventDto,
 		type Direction
 	} from '$lib/transit';
 
@@ -27,6 +30,17 @@
 		friday: 'Freitag',
 		saturday: 'Samstag',
 		sunday: 'Sonntag'
+	};
+
+	/** "Montags": the statistics of one weekday, as the scope switch names them. */
+	const DAY_TYPE_ADVERBS: Record<DayType, string> = {
+		monday: 'Montags',
+		tuesday: 'Dienstags',
+		wednesday: 'Mittwochs',
+		thursday: 'Donnerstags',
+		friday: 'Freitags',
+		saturday: 'Samstags',
+		sunday: 'Sonntags'
 	};
 
 	type QueryMeta = { stationId: string; stationName: string; time: string; date: string };
@@ -85,10 +99,35 @@
 	let queryMeta = $state<QueryMeta | null>(null);
 	let toastMsg = $state('');
 	let toastVisible = $state(false);
+	/** The days the statistics are drawn from, as last picked. */
+	let delayScope = $state<DelayScope>(savedDelayScope());
+	/** The scopes the latest lookup has statistics for - all three, or just 'day'
+	 *  with a bundle built before the pools existed. */
+	let delayScopes = $state<DelayScope[]>(['day']);
 
 	const dayType = $derived(dayTypeOf(parseIsoDate(date)));
 	const selectedHoliday = $derived(holidayName(parseIsoDate(date)));
 	const dayUnavailable = $derived(!serviceDays.includes(dayType));
+	// The pick where the data has it, the finest one there is otherwise.
+	const scope = $derived(delayScopes.includes(delayScope) ? delayScope : (delayScopes[0] ?? 'day'));
+
+	/** A departure's statistics in the chosen scope. */
+	function stats(dto: DepartureDto): DepartureEventDto {
+		return dto.departure[scope];
+	}
+
+	function scopeLabel(option: DelayScope, dto: DepartureDto) {
+		if (option === 'all') return 'Alle Tage';
+		if (option === 'day') return DAY_TYPE_ADVERBS[dto.serviceDayType];
+		return dto.serviceDayType === 'saturday' || dto.serviceDayType === 'sunday'
+			? 'Wochenende'
+			: 'Mo–Fr';
+	}
+
+	function setDelayScope(next: DelayScope) {
+		delayScope = next;
+		saveDelayScope(next);
+	}
 
 	function pad2(n: number) {
 		return String(n).padStart(2, '0');
@@ -204,7 +243,7 @@
 	 * 9 of 10 cases.
 	 */
 	function heroInfo(dto: DepartureDto) {
-		const buffer = dto.departure.catchBufferSeconds;
+		const buffer = stats(dto).catchBufferSeconds;
 		if (buffer == null) {
 			return {
 				clock: null,
@@ -232,8 +271,8 @@
 	 * marker for each. Positions are percentages of the track.
 	 */
 	function timeline(dto: DepartureDto) {
-		const avg = dto.departure.delaySeconds;
-		const buffer = dto.departure.catchBufferSeconds;
+		const avg = stats(dto).delaySeconds;
+		const buffer = stats(dto).catchBufferSeconds;
 		const values = [avg, buffer].filter((v): v is number => v != null);
 		if (!values.length) return null;
 		const lo = Math.min(0, ...values.map((v) => Math.floor(v / 30) * 30));
@@ -335,6 +374,7 @@
 			// which can rank onto a different station once the feed changes.
 			meta = { ...meta, stationId: stopId, stationName: data.query.from.name };
 			resultDayType = data.dayType;
+			delayScopes = data.delayScopes;
 			const preselected = pick
 				? data.results.find(
 						(r) =>
@@ -432,6 +472,7 @@
 			listLatest = data.latest;
 			listDate = useDate;
 			resultDayType = data.dayType;
+			delayScopes = data.delayScopes;
 			screen = 'board';
 		} catch (err) {
 			statusMsg =
@@ -748,7 +789,7 @@
 			<button class="pager" type="button" onclick={goEarlier} disabled={busy}>↑ Früher</button>
 			{#each listResults as r (r.plannedDepartureMinutes + ':' + r.line + ':' + (r.destination?.id ?? ''))}
 				{@const current = isCurrent(r)}
-				{@const delay = r.departure.delaySeconds}
+				{@const delay = stats(r).delaySeconds}
 				<button
 					type="button"
 					class="board-row departure"
@@ -781,6 +822,7 @@
 	{#if screen === 'result' && result}
 		{@const hero = heroInfo(result)}
 		{@const tl = timeline(result)}
+		{@const st = stats(result)}
 		<h1 class="sr-only">Wie spät ist zu spät?</h1>
 		<button type="button" class="back" onclick={showAlternatives} disabled={busy}>
 			← Andere Abfahrt
@@ -802,6 +844,20 @@
 				{#if result.from.platform}<span class="sr-only">{platformWord(result.mode)} </span>{result.from.platform}{/if}
 			</span>
 		</div>
+
+		{#if delayScopes.length > 1}
+			<div class="segmented scope" role="group" aria-label="Verspätungsdaten von">
+				{#each delayScopes as option (option)}
+					<button
+						type="button"
+						aria-pressed={scope === option}
+						onclick={() => setDelayScope(option)}
+					>
+						{scopeLabel(option, result)}
+					</button>
+				{/each}
+			</div>
+		{/if}
 
 		<section class="verdict">
 			{#if hero.clock}
@@ -851,15 +907,13 @@
 			<div class="stat">
 				<span class="stat-label">Ø Verspätung</span>
 				<span class="stat-value accent">
-					{result.departure.delaySeconds != null ? fmtSeconds(result.departure.delaySeconds, true) : '—'}
+					{st.delaySeconds != null ? fmtSeconds(st.delaySeconds, true) : '—'}
 				</span>
 			</div>
 			<div class="stat">
 				<span class="stat-label">Sicherer Puffer</span>
 				<span class="stat-value">
-					{result.departure.catchBufferSeconds != null
-						? fmtSeconds(result.departure.catchBufferSeconds)
-						: '—'}
+					{st.catchBufferSeconds != null ? fmtSeconds(st.catchBufferSeconds) : '—'}
 				</span>
 			</div>
 		</div>

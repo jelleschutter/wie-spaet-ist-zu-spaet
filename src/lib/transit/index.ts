@@ -16,6 +16,8 @@ export type {
 	StaticMeta,
 	StopDto
 } from './planner';
+export { DELAY_SCOPES, delaySetOf } from './delays';
+export type { DelayGroup, DelayScope, DelaySet } from './delays';
 export { addDays, dayTypeOf, isoDate, parseIsoDate, secondsToClock } from './time';
 export type { DayType } from './time';
 export { holidayName, isHoliday } from './holidays';

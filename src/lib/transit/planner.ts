@@ -1,7 +1,14 @@
 import { StopsIndex } from 'minotor';
 import type { Stop } from 'minotor';
 import { fetchBinary, fetchJson } from './assets';
-import { DelayIndex, type DelaysMeta, type StationDelays } from './delays';
+import {
+	DELAY_SCOPES,
+	DelayIndex,
+	delaySetOf,
+	type DelayScope,
+	type DelaysMeta,
+	type StationDelays
+} from './delays';
 import { formatDelay, hmToMinutes, minutesToClock, secondsToClock, type DayType } from './time';
 import { Timetable, type ServiceRouteInfo, type TimetableRoute } from './timetable';
 
@@ -85,7 +92,11 @@ export type DepartureDto = {
 	/** The same time in minotor's minutes-from-midnight, which - unlike the
 	 *  clock string - keeps counting past 24:00 and can be paged on. */
 	plannedDepartureMinutes: number;
-	departure: DepartureEventDto;
+	/** The day the trip runs on: the one before the queried date for a trip
+	 *  that left before midnight. Its statistics are that day's. */
+	serviceDayType: DayType;
+	/** The delay statistics per scope, so switching between them needs no new lookup. */
+	departure: Record<DelayScope, DepartureEventDto>;
 };
 
 export type DeparturesResult = {
@@ -95,6 +106,8 @@ export type DeparturesResult = {
 	dayType: DayType | null;
 	days: number | null;
 	availableDayTypes: DayType[];
+	/** The scopes the bundle has statistics for on the queried day. */
+	delayScopes: DelayScope[];
 	nextDepartureTime: string | null;
 	results: DepartureDto[];
 };
@@ -115,6 +128,7 @@ export type DepartureListResult = {
 	dayType: DayType | null;
 	days: number | null;
 	availableDayTypes: DayType[];
+	delayScopes: DelayScope[];
 	/** Anchors for the adjacent pages, in minutes (see `plannedDepartureMinutes`). */
 	earliest: number | null;
 	latest: number | null;
@@ -131,7 +145,8 @@ export type DepartureListResult = {
 type Segment = {
 	dayType: DayType;
 	timetable: Timetable;
-	stationDelays: StationDelays | null;
+	/** The station's delay rows per scope; missing where the bundle has none. */
+	stationDelays: Partial<Record<DelayScope, StationDelays | null>>;
 	offset: number;
 };
 
@@ -161,6 +176,7 @@ type Board = {
 		dayType: DayType | null;
 		days: number | null;
 		availableDayTypes: DayType[];
+		delayScopes: DelayScope[];
 	};
 };
 
@@ -527,16 +543,24 @@ export class TransitPlanner {
 		const bpuic = bpuicOf(station ?? origin) ?? bpuicOf(origin);
 
 		const segmentFor = async (type: DayType, file: string, offset: number): Promise<Segment> => {
-			// Strictly this day's shard: falling back to another day's would label
-			// one service's delays with another's.
-			const delayDayType = delays.dayTypes.includes(type) ? type : null;
-			const [timetable, stationDelays] = await Promise.all([
+			// Strictly this day's shards: falling back to another day's would label
+			// one service's delays with another's. Every scope is loaded up front -
+			// a shard is ~20 KB, and switching scope then needs no new lookup.
+			const sets = DELAY_SCOPES.map((scope) => delaySetOf(scope, type));
+			const [timetable, ...stationDelays] = await Promise.all([
 				this.lookupTimetable(file),
-				delayDayType && bpuic != null
-					? delays.forStation(delayDayType, bpuic)
-					: Promise.resolve(null)
+				...sets.map((set) =>
+					delays.has(set) && bpuic != null ? delays.forStation(set, bpuic) : Promise.resolve(null)
+				)
 			]);
-			return { dayType: type, timetable, stationDelays, offset };
+			return {
+				dayType: type,
+				timetable,
+				stationDelays: Object.fromEntries(
+					DELAY_SCOPES.map((scope, i) => [scope, stationDelays[i]])
+				),
+				offset
+			};
 		};
 
 		// No fallback here either: a day the bundle doesn't carry means there is no
@@ -573,7 +597,10 @@ export class TransitPlanner {
 				delaysAvailable: delays.dayTypes.length > 0,
 				dayType: useDayType,
 				days: useDayType ? delays.daysFor(useDayType) : null,
-				availableDayTypes: delays.dayTypes
+				availableDayTypes: delays.dayTypes,
+				delayScopes: DELAY_SCOPES.filter((scope) =>
+					delays.has(delaySetOf(scope, serviceDayType))
+				)
 			}
 		};
 	}
@@ -612,29 +639,36 @@ export class TransitPlanner {
 		{ route, boardStopId, departureTime, serviceTime, segment, serviceInfo }: Candidate,
 		taken: ReadonlySet<string>
 	): DepartureDto {
-		const stationDelays = segment.stationDelays;
 		const boardStop = stopsIndex.findStopById(boardStopId)!;
 		const destStop = stopsIndex.findStopById(route.stopId(route.getNbStops() - 1));
 
-		const dto: DepartureDto = {
+		return {
 			line: serviceInfo.name,
 			mode: ROUTE_TYPE_LABELS[serviceInfo.type] ?? 'OTHER',
 			from: this.stopDto(boardStop),
 			destination: destStop ? this.stopDto(destStop) : null,
 			plannedDeparture: minutesToClock(departureTime),
 			plannedDepartureMinutes: departureTime,
-			departure: eventTiming(departureTime, null)
+			serviceDayType: segment.dayType,
+			departure: Object.fromEntries(
+				DELAY_SCOPES.map((scope) => {
+					const match = segment.stationDelays[scope]?.match(
+						serviceInfo.name,
+						serviceTime % (24 * 60),
+						taken
+					);
+					const timing = match
+						? {
+								delaySec: match.avg,
+								catchBufferSec: match.catchBuffer,
+								samples: match.samples,
+								dayOffset: match.dayOffset
+							}
+						: null;
+					return [scope, eventTiming(departureTime, timing)];
+				})
+			) as Record<DelayScope, DepartureEventDto>
 		};
-
-		const match = stationDelays?.match(serviceInfo.name, serviceTime % (24 * 60), taken);
-		if (!match) return dto;
-		dto.departure = eventTiming(departureTime, {
-			delaySec: match.avg,
-			catchBufferSec: match.catchBuffer,
-			samples: match.samples,
-			dayOffset: match.dayOffset
-		});
-		return dto;
 	}
 
 	private stopDto(stop: Stop): StopDto {

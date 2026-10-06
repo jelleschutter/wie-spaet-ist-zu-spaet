@@ -600,6 +600,20 @@ input::placeholder {
 	color: var(--text);
 }
 
+/* "Montags / Mo–Fr / Alle Tage": which days the numbers below are drawn from */
+.segmented.scope {
+	padding: 6px;
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+}
+.segmented.scope button {
+	flex: 1 1 auto;
+	min-width: 0;
+	padding: 0 8px;
+	white-space: nowrap;
+}
+
 .timeline {
 	position: relative;
 	height: 72px;

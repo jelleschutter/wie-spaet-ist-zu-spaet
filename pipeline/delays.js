@@ -12,7 +12,9 @@
  *      allocated for the 12 of 21 columns that get thrown away.
  *   2. Per weekday, that weekday's ~52 sample files are aggregated into one row
  *      per scheduled service: sample count, average delay and the 10th percentile
- *      - the "how late can I still be" buffer the app shows.
+ *      - the "how late can I still be" buffer the app shows. The same happens
+ *      once more for each pool of weekdays (Mo-Fr, weekend, all), which the app
+ *      offers as a broader basis for the same numbers.
  *
  * Both stages are resumable: a day whose sample file already exists is skipped,
  * and each sample file carries its own line texts so a partial run can still
@@ -41,6 +43,7 @@ import { holidayName } from '../src/lib/transit/holidays.ts';
 import {
 	BUCKETS,
 	DAY_TYPES,
+	DELAY_GROUPS,
 	FORMAT_VERSION,
 	I16_MAX,
 	I16_MIN,
@@ -691,7 +694,7 @@ function kthSmallest(pool, from, to, k) {
 const roundHalfUp = (value) => (value < 0 ? -Math.round(-value) : Math.round(value));
 
 /**
- * Aggregates one day type's samples into one row per scheduled service.
+ * Aggregates one day type's (or one pool's) samples into one row per scheduled service.
  *
  * Runs in `chunks` passes over `bpuic % chunks`, which bounds peak memory no
  * matter how many months are in the samples: the exact percentile has to hold
@@ -945,11 +948,12 @@ function writeShards(out, dest) {
 }
 
 /**
- * Aggregates the samples per day type and writes the gzipped delay shards.
+ * Aggregates the samples per day type and per DELAY_GROUPS pool, and writes the
+ * gzipped delay shards.
  *
  * `days` is what extract() returned, and only those days' samples are read.
  *
- * @returns {Promise<{ dayTypes: string[], rows: number, files: number,
+ * @returns {Promise<{ dayTypes: string[], groups: string[], rows: number, files: number,
  *                     bytes: number, stations: number }>}
  */
 export async function shard(
@@ -989,24 +993,33 @@ export async function shard(
 
 	const stations = new Set();
 	const covered = [];
+	const coveredGroups = [];
 	let totalRows = 0;
 	let totalFiles = 0;
 	let totalBytes = 0;
 	let totalClamped = 0;
 
-	for (const dayType of DAY_TYPES) {
-		// The days this run extracted, not whatever the samples directory holds:
-		// files of months that have since left the window stay on disk, and
-		// neither their delays nor their lines belong in this build.
-		const files = (days[dayType] ?? []).toSorted().map((day) => sampleFile(dayType, day));
-		if (files.length === 0) {
-			log(`  ${dayType}: no samples - skipped`);
-			continue;
-		}
+	// The days this run extracted, not whatever the samples directory holds:
+	// files of months that have since left the window stay on disk, and neither
+	// their delays nor their lines belong in this build.
+	const filesOf = (dayType) =>
+		(days[dayType] ?? []).toSorted().map((day) => sampleFile(dayType, day));
 
-		const written = await timed(`${dayType} aggregation`, async () => {
-			const out = aggregateDayType(files, lineIndex, allowedBits, maxBpuic, minSamples, chunks);
-			const result = writeShards(out, path.join(buildDir, dayType));
+	/** Aggregates `dayTypes`' samples into delays/<name>/; false when there are none. */
+	const aggregate = async (name, dayTypes) => {
+		const withSamples = dayTypes.filter((dayType) => filesOf(dayType).length > 0);
+		const files = withSamples.flatMap(filesOf);
+		if (files.length === 0) {
+			log(`  ${name}: no samples - skipped`);
+			return false;
+		}
+		// One pass per `chunks` per day type keeps each pass at the size of a
+		// single weekday's, so a pool of seven costs time, not seven times the memory.
+		const passes = chunks * withSamples.length;
+
+		const written = await timed(`${name} aggregation`, async () => {
+			const out = aggregateDayType(files, lineIndex, allowedBits, maxBpuic, minSamples, passes);
+			const result = writeShards(out, path.join(buildDir, name));
 			for (const bpuic of result.stations) stations.add(bpuic);
 			return {
 				rows: out.count,
@@ -1020,16 +1033,22 @@ export async function shard(
 		totalFiles += written.files;
 		totalBytes += written.bytes;
 		totalClamped += written.clamped;
-		covered.push(dayType);
-		log(
-			`  ${dayType}: ${num(written.rows)} services, ${num(written.files)} shards, ${mb(written.bytes)}`
-		);
-		if (written.ignoredRows) {
+		log(`  ${name}: ${num(written.rows)} services, ${num(written.files)} shards, ${mb(written.bytes)}`);
+		// A pool reads the same samples as its day types, which have reported these already.
+		if (written.ignoredRows && dayTypes.length === 1) {
 			log(
 				`    ignored ${num(written.ignoredRows)} samples of lines not in the line table: ` +
 					[...written.ignoredLines].slice(0, 10).join(', ')
 			);
 		}
+		return true;
+	};
+
+	for (const dayType of DAY_TYPES) {
+		if (await aggregate(dayType, [dayType])) covered.push(dayType);
+	}
+	for (const [group, dayTypes] of Object.entries(DELAY_GROUPS)) {
+		if (await aggregate(group, dayTypes)) coveredGroups.push(group);
 	}
 
 	const oldDir = `${delaysDir}.old`;
@@ -1044,6 +1063,7 @@ export async function shard(
 
 	return {
 		dayTypes: covered,
+		groups: coveredGroups,
 		rows: totalRows,
 		files: totalFiles,
 		bytes: totalBytes,

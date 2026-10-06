@@ -36,6 +36,16 @@ export const DAY_TYPES = [
 	'sunday'
 ];
 
+// Pools of day types aggregated on top of the single weekdays: the app lets the
+// visitor trade a weekday's own pattern for more observations. Each is written
+// like a day type, to delays/<group>/. Holidays count as Sunday, so they land in
+// the weekend. Keep in sync with DelayGroup in src/lib/transit/delays.ts.
+export const DELAY_GROUPS = {
+	weekdays: DAY_TYPES.slice(0, 5),
+	weekend: DAY_TYPES.slice(5),
+	all: DAY_TYPES
+};
+
 // Delay rows are sharded by `bpuic % BUCKETS` per day type: enough buckets that
 // one lookup fetches ~20 KB, few enough to stay a manageable file count.
 export const BUCKETS = 1024;
