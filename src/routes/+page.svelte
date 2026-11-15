@@ -1,6 +1,8 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
-	import { replaceState } from '$app/navigation';
+	import { onMount, tick } from 'svelte';
+	import { pushState, replaceState } from '$app/navigation';
+	import { fly } from 'svelte/transition';
+	import { cubicOut } from 'svelte/easing';
 	import StationAutocomplete from '$lib/components/StationAutocomplete.svelte';
 	import { recentStations, rememberStation, type RecentStation } from '$lib/recentStations';
 	import { saveDelayScope, savedDelayScope } from '$lib/delayScope';
@@ -51,6 +53,9 @@
 	/** How many either side of the next (or current) departure the board opens with. */
 	const AROUND_SIZE = 2;
 
+	/** How many departures one scroll-triggered load adds above or below the list. */
+	const LOAD_SIZE = 12;
+
 	/** How many recent stations the start screen offers as chips. */
 	const RECENT_CHIPS = 3;
 
@@ -68,7 +73,74 @@
 
 	const WEEKDAY_SHORT_FORMAT = new Intl.DateTimeFormat('de-CH', { weekday: 'short' });
 
-	let screen = $state<'form' | 'board' | 'result'>('form');
+	type Screen = 'form' | 'board' | 'result';
+	let screen = $state<Screen>('form');
+	/** Slide direction of the next screen change: 1 = forward, -1 = back. */
+	let navDir = 1;
+	const SCREEN_ORDER: Record<Screen, number> = { form: 0, board: 1, result: 2 };
+	const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+	/**
+	 * Lets the browser paint what was just set (a spinner) before heavy synchronous
+	 * work starts. Without it a state change made right before a long lookup only
+	 * reaches the screen after the lookup, so the control just looked disabled.
+	 */
+	async function yieldToPaint() {
+		await tick();
+		await new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+	}
+
+	function haptic() {
+		// Android only; iOS has no web haptics API. Silently ignored elsewhere.
+		try {
+			navigator.vibrate?.(8);
+		} catch {
+			/* not allowed */
+		}
+	}
+
+	/** Slide the incoming screen in from the side it logically comes from. */
+	function slide(_node: Element) {
+		return {
+			duration: reducedMotion() ? 0 : 240,
+			easing: cubicOut,
+			x: navDir * 32,
+			opacity: 0
+		};
+	}
+
+	function setScreen(next: Screen) {
+		navDir = SCREEN_ORDER[next] >= SCREEN_ORDER[screen] ? 1 : -1;
+		screen = next;
+	}
+
+	// Native-style back navigation: every step deeper (search → board → result)
+	// is a history entry, so the system back gesture / button goes one screen
+	// back instead of leaving the app. `depth` counts the entries we pushed.
+	let depth = 0;
+	let ignorePop = false;
+
+	function pushStep(url: string | URL = location.href) {
+		pushState(url, {});
+		depth++;
+	}
+
+	function back() {
+		if (depth > 0) history.back();
+		else if (screen === 'result') showAlternatives();
+		else goAgain();
+	}
+
+	function onPopState() {
+		if (ignorePop) {
+			ignorePop = false;
+			return;
+		}
+		if (depth === 0) return;
+		depth--;
+		if (screen === 'result') showAlternatives();
+		else if (screen === 'board') resetToForm();
+	}
 	let stationName = $state('');
 	let stationId = $state<string | null>(null);
 	/** "Jetzt" keeps time and date on the current moment; "Später" lets you pick them. */
@@ -91,6 +163,44 @@
 	let listLatest = $state<number | null>(null);
 	// Paging can walk off the queried date, so the shown page carries its own.
 	let listDate = $state<string | null>(null);
+	// Scrolling the board adds departures in place instead of replacing the page.
+	let boardScroll = $state<HTMLElement>();
+	// One flag per direction: an insert above may wait for the scroll to come to
+	// rest, and that must never hold up loading below (it looked like a hang).
+	let loadingEarlier = $state(false);
+	let loadingLater = $state(false);
+	const isLoading = (direction: Direction) =>
+		direction === 'earlier' ? loadingEarlier : loadingLater;
+	/** A pager that is replacing the list with the neighbouring date. */
+	let rollDir = $state<Direction | null>(null);
+	// Set when a date has no more departures in that direction: the pager then
+	// steps to the neighbouring date, replacing the list (the old behaviour).
+	let edgeEarlier = $state(false);
+	let edgeLater = $state(false);
+	// iOS ignores or undoes scrollTop writes while a finger is down or momentum
+	// is running, which made the list jump when rows were inserted above. Track
+	// both so inserting above can wait for the list to come to rest.
+	let touching = false;
+	let lastScrollAt = 0;
+	// The board opens with earlier rows already above the first one shown, so the
+	// list never rests at scrollTop 0 where iOS rubber-bands: inserting rows while
+	// it bounces back is what made the first insert jump.
+	let primedEarlier = false;
+	// Scroll events caused by our own position corrections must not load more.
+	let ignoreScrollUntil = 0;
+
+	function whenScrollIdle(): Promise<void> {
+		return new Promise((resolve) => {
+			const started = Date.now();
+			const check = () => {
+				// Negative scrollTop = iOS rubber-band overscroll still bouncing back.
+				const quiet = !touching && Date.now() - lastScrollAt > 150 && (boardScroll?.scrollTop ?? 0) >= 0;
+				if (quiet || Date.now() - started > 4000) resolve();
+				else setTimeout(check, 60);
+			};
+			check();
+		});
+	}
 	// The minute of the first departure the query found, marked on the board
 	// until a result has been opened.
 	let nextMinutes = $state<number | null>(null);
@@ -332,8 +442,14 @@
 		result = dto;
 		queryMeta = meta;
 		resultDayType = dayTypeUsed;
-		screen = 'result';
-		replaceState(buildShareUrl(dto, meta), {});
+		const fromBoard = screen === 'board';
+		setScreen('result');
+		if (fromBoard) {
+			haptic();
+			pushStep(buildShareUrl(dto, meta));
+		} else {
+			replaceState(buildShareUrl(dto, meta), {});
+		}
 	}
 
 	async function runSearch(meta: QueryMeta, pick?: { line: string; dest: string | null }) {
@@ -437,6 +553,7 @@
 		statusMsg = '';
 		statusError = false;
 		try {
+			await yieldToPaint();
 			let useDate = date;
 			let useAt = at;
 			let data = await fetchPage(direction, useAt, limit, useDate);
@@ -467,13 +584,17 @@
 				statusError = true;
 				return;
 			}
+			edgeEarlier = false;
+			edgeLater = false;
+			primedEarlier = false;
 			listResults = data.results;
 			listEarliest = data.earliest;
 			listLatest = data.latest;
 			listDate = useDate;
 			resultDayType = data.dayType;
 			delayScopes = data.delayScopes;
-			screen = 'board';
+			if (screen === 'form') pushStep();
+			setScreen('board');
 		} catch (err) {
 			statusMsg =
 				err instanceof TransitError
@@ -485,16 +606,124 @@
 		}
 	}
 
-	function goEarlier() {
+	const depKey = (r: DepartureDto) =>
+		r.plannedDepartureMinutes + ':' + r.line + ':' + (r.destination?.id ?? '');
+
+	/**
+	 * Adds the next departures before or after the list without touching the
+	 * ones shown: the scroll position stays put, new rows just appear.
+	 */
+	async function loadMore(direction: Direction) {
 		const window = shownWindow();
-		if (window) showPage('earlier', window.earliest, PAGE_SIZE, window.date);
+		const el = boardScroll;
+		if (!window || !el || isLoading(direction) || busy || !queryMeta) return;
+		if (direction === 'earlier' ? edgeEarlier : edgeLater) return;
+		if (direction === 'earlier') loadingEarlier = true;
+		else loadingLater = true;
+		try {
+			await yieldToPaint();
+			const data = await fetchPage(
+				direction,
+				direction === 'earlier' ? window.earliest : window.latest + 1,
+				LOAD_SIZE,
+				window.date
+			);
+			// The list may have been replaced (new search, other date) meanwhile.
+			if (listDate !== window.date || listEarliest !== window.earliest) return;
+			const known = new Set(listResults.map(depKey));
+			const fresh = data.results.filter((r) => !known.has(depKey(r)));
+			if (!fresh.length) {
+				if (direction === 'earlier') edgeEarlier = true;
+				else edgeLater = true;
+				return;
+			}
+			if (direction === 'earlier') {
+				// The data is ready; put it in once the list is at rest, then keep
+				// what the user was looking at exactly where it was.
+				await whenScrollIdle();
+				if (listDate !== window.date || listEarliest !== window.earliest) return;
+				// Anchor on a row that is on screen and put exactly that row back
+				// where it was: immune to heights changing meanwhile (web fonts,
+				// a second insert) which a plain height difference is not.
+				const box = el.getBoundingClientRect();
+				const anchorEl = [...el.querySelectorAll<HTMLElement>('[data-key]')].find(
+					(row) => row.getBoundingClientRect().bottom > box.top + 1
+				);
+				const anchorKey = anchorEl?.dataset.key;
+				const anchorOffset = anchorEl ? anchorEl.getBoundingClientRect().top - box.top : 0;
+				const restore = () => {
+					if (!anchorKey) return;
+					const row = [...el.querySelectorAll<HTMLElement>('[data-key]')].find(
+						(r) => r.dataset.key === anchorKey
+					);
+					if (!row) return;
+					const drift = row.getBoundingClientRect().top - el.getBoundingClientRect().top - anchorOffset;
+					if (Math.abs(drift) > 0.5) el.scrollTop += drift;
+				};
+				listResults = [...fresh, ...listResults];
+				listEarliest = data.earliest ?? listEarliest;
+				await tick();
+				ignoreScrollUntil = Date.now() + 400;
+				restore();
+				// iOS can lay out a frame late; re-anchoring on the same row is safe.
+				requestAnimationFrame(restore);
+			} else {
+				listResults = [...listResults, ...fresh];
+				listLatest = data.latest ?? listLatest;
+			}
+		} catch {
+			/* leave the list as it is; the pager buttons still work */
+		} finally {
+			if (direction === 'earlier') loadingEarlier = false;
+			else loadingLater = false;
+		}
+	}
+
+	function onBoardScroll() {
+		lastScrollAt = Date.now();
+		const el = boardScroll;
+		if (!el || Date.now() < ignoreScrollUntil) return;
+		// Start early: the rows should exist before the finger reaches the edge.
+		if (el.scrollHeight - el.scrollTop - el.clientHeight < 900) loadMore('later');
+		else if (el.scrollTop < 500) loadMore('earlier');
+	}
+
+	// A short list may not even overflow, so there would be nothing to scroll:
+	// keep adding below until the list is taller than the screen.
+	$effect(() => {
+		void listResults;
+		void loadingEarlier;
+		void loadingLater;
+		void busy;
+		if (screen !== 'board' || !boardScroll || loadingLater || edgeLater) return;
+		tick().then(() => {
+			const el = boardScroll;
+			if (!el) return;
+			if (el.scrollHeight <= el.clientHeight + 200) loadMore('later');
+			else if (!primedEarlier && !edgeEarlier && el.scrollTop <= 1) {
+				// Put earlier rows above the first one now, before anyone touches it.
+				primedEarlier = true;
+				loadMore('earlier');
+			}
+		});
+	});
+
+	function goEarlier() {
+		if (!edgeEarlier) return void loadMore('earlier');
+		const window = shownWindow();
+		if (!window) return;
+		rollDir = 'earlier';
+		showPage('earlier', window.earliest, PAGE_SIZE, window.date).finally(() => (rollDir = null));
 	}
 
 	function goLater() {
+		if (!edgeLater) return void loadMore('later');
 		// A page always holds whole minutes, so starting one minute past the last
 		// one shown skips exactly what's already on screen.
 		const window = shownWindow();
-		if (window) showPage('later', window.latest + 1, PAGE_SIZE, window.date);
+		if (!window) return;
+		rollDir = 'later';
+		showPage('later', window.latest + 1, PAGE_SIZE, window.date).finally(() => (rollDir = null));
 	}
 
 	function showAlternatives() {
@@ -586,6 +815,17 @@
 	}
 
 	function goAgain() {
+		if (depth > 0) {
+			// Drop the entries we pushed so back doesn't land on a stale screen.
+			ignorePop = true;
+			const n = depth;
+			depth = 0;
+			history.go(-n);
+		}
+		resetToForm();
+	}
+
+	function resetToForm() {
 		replaceState(location.pathname, {});
 		result = null;
 		listResults = [];
@@ -601,7 +841,7 @@
 		updateTimeToNow();
 		refreshDateWindow();
 		syncNow();
-		screen = 'form';
+		setScreen('form');
 	}
 
 	async function share() {
@@ -696,8 +936,18 @@
 	<span class="line-badge">{line}</span>
 {/snippet}
 
-<main class="screen-{screen}">
+{#snippet credits()}
+<footer>
+	Erstellt von
+	<a href="https://jelle.schutter.xyz" target="_blank" rel="noopener noreferrer">Jelle Schutter</a>
+	· Daten:
+	<a href="https://opentransportdata.swiss" target="_blank" rel="noopener noreferrer">opentransportdata.swiss</a>
+</footer>
+{/snippet}
+
+<main class="screen-{screen}" class:app={screen !== 'form'}>
 	{#if screen === 'form'}
+		<div class="view" in:slide>
 		<header class="intro">
 			<h1>Wie spät ist zu spät?</h1>
 		</header>
@@ -763,11 +1013,15 @@
 				</div>
 			</section>
 		{/if}
+		{@render credits()}
+		</div>
 	{/if}
 
 	{#if screen === 'board' && listResults.length}
+		<div class="view" in:slide>
+		<div class="app-top">
 		<header class="board-head">
-			<button type="button" class="back" onclick={goAgain}>← Neue Suche</button>
+			<button type="button" class="back" onclick={back}>← Neue Suche</button>
 			<div class="board-title">
 				<h1>{queryMeta?.stationName || 'Abfahrten'}</h1>
 				{#if queryMeta}<span class="board-clock">{queryMeta.time}</span>{/if}
@@ -777,7 +1031,17 @@
 			</p>
 		</header>
 		{@render status()}
+		</div>
 
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div
+			class="app-scroll"
+			bind:this={boardScroll}
+			onscroll={onBoardScroll}
+			ontouchstart={() => (touching = true)}
+			ontouchend={() => ((touching = false), (lastScrollAt = Date.now()))}
+			ontouchcancel={() => (touching = false)}
+		>
 		<div class="board">
 			<div class="board-row board-columns" aria-hidden="true">
 				<span>Zeit</span>
@@ -786,13 +1050,26 @@
 					{listResults.some((r) => TRACK_MODES.has(r.mode)) ? 'Gleis' : 'Kante'}
 				</span>
 			</div>
-			<button class="pager" type="button" onclick={goEarlier} disabled={busy}>↑ Früher</button>
-			{#each listResults as r (r.plannedDepartureMinutes + ':' + r.line + ':' + (r.destination?.id ?? ''))}
+			<button
+				class="pager"
+				type="button"
+				onclick={goEarlier}
+				disabled={busy || loadingEarlier}
+				aria-busy={loadingEarlier || rollDir === 'earlier'}
+			>
+				{#if loadingEarlier || rollDir === 'earlier'}
+					<span class="spinner" role="status" aria-label="Frühere Abfahrten werden geladen"></span>
+				{:else}
+					{edgeEarlier ? '↑ Vorheriger Tag' : '↑ Früher'}
+				{/if}
+			</button>
+			{#each listResults as r (depKey(r))}
 				{@const current = isCurrent(r)}
 				{@const delay = stats(r).delaySeconds}
 				<button
 					type="button"
 					class="board-row departure"
+					data-key={depKey(r)}
 					class:selected={current || isNext(r)}
 					aria-current={current ? 'true' : undefined}
 					onclick={() => pick(r)}
@@ -815,7 +1092,22 @@
 					</span>
 				</button>
 			{/each}
-			<button class="pager" type="button" onclick={goLater} disabled={busy}>↓ Später</button>
+			<button
+				class="pager"
+				type="button"
+				onclick={goLater}
+				disabled={busy || loadingLater}
+				aria-busy={loadingLater || rollDir === 'later'}
+			>
+				{#if loadingLater || rollDir === 'later'}
+					<span class="spinner" role="status" aria-label="Spätere Abfahrten werden geladen"></span>
+				{:else}
+					{edgeLater ? '↓ Nächster Tag' : '↓ Später'}
+				{/if}
+			</button>
+		</div>
+		{@render credits()}
+		</div>
 		</div>
 	{/if}
 
@@ -823,11 +1115,16 @@
 		{@const hero = heroInfo(result)}
 		{@const tl = timeline(result)}
 		{@const st = stats(result)}
+		<div class="view" in:slide>
 		<h1 class="sr-only">Wie spät ist zu spät?</h1>
-		<button type="button" class="back" onclick={showAlternatives} disabled={busy}>
+		<div class="app-top">
+		<button type="button" class="back" onclick={back} disabled={busy}>
 			← Andere Abfahrt
 		</button>
 		{@render status()}
+		</div>
+
+		<div class="app-scroll">
 
 		<div class="board-row departure-card">
 			<span class="clock">{result.plannedDeparture}</span>
@@ -918,18 +1215,19 @@
 			</div>
 		</div>
 
+		{@render credits()}
+		</div>
+
+		<div class="app-bottom">
 		<div class="actions">
 			<button class="btn btn-outline" type="button" onclick={share}>Teilen</button>
 			<button class="btn btn-light" type="button" onclick={goAgain}>Neue Suche</button>
 		</div>
+		</div>
+		</div>
 	{/if}
-
-	<footer>
-		Erstellt von
-		<a href="https://jelle.schutter.xyz" target="_blank" rel="noopener noreferrer">Jelle Schutter</a>
-		· Daten:
-		<a href="https://opentransportdata.swiss" target="_blank" rel="noopener noreferrer">opentransportdata.swiss</a>
-	</footer>
 </main>
+
+<svelte:window onpopstate={onPopState} />
 
 <div class="toast" class:show={toastVisible} role="status">{toastMsg}</div>

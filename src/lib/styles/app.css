@@ -29,8 +29,14 @@
 * {
 	box-sizing: border-box;
 }
+html {
+	background: var(--bg);
+	-webkit-text-size-adjust: 100%;
+	-webkit-tap-highlight-color: transparent;
+}
 body {
 	margin: 0;
+	overscroll-behavior: none;
 	background: var(--bg);
 	color: var(--text);
 	font: 400 16px/1.45 var(--font-body);
@@ -88,6 +94,86 @@ main.screen-result {
 	gap: 16px;
 }
 
+/* App screens (departure board, result): a fixed top bar and bottom bar with
+   only the middle scrolling, like a native app. The page itself never scrolls. */
+html:has(main.app),
+body:has(main.app) {
+	height: 100%;
+	overflow: hidden;
+}
+main.app {
+	height: 100vh;
+	height: 100dvh;
+	min-height: 0;
+	padding: 0;
+	gap: 0;
+	overflow: hidden;
+}
+.app-top {
+	flex: none;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+	padding-top: calc(16px + env(safe-area-inset-top, 0px));
+	padding-bottom: 12px;
+	border-bottom: 1px solid var(--line);
+	background: var(--bg);
+}
+.screen-result .app-top {
+	padding-left: calc(16px + env(safe-area-inset-left, 0px));
+	padding-right: calc(16px + env(safe-area-inset-right, 0px));
+	gap: 4px;
+}
+.screen-board .app-top {
+	gap: 8px;
+}
+.app-scroll {
+	overflow-anchor: none; /* the board compensates for prepended rows itself */
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	-webkit-overflow-scrolling: touch;
+	display: flex;
+	flex-direction: column;
+	scrollbar-width: thin;
+}
+.screen-result .app-scroll {
+	padding: 16px calc(16px + env(safe-area-inset-left, 0px)) 16px
+		calc(16px + env(safe-area-inset-left, 0px));
+	gap: 16px;
+}
+.screen-board .app-scroll {
+	gap: 14px;
+	padding-bottom: 16px;
+}
+.app-scroll > * {
+	flex: none;
+}
+.app-bottom {
+	flex: none;
+	padding: 12px calc(16px + env(safe-area-inset-left, 0px))
+		calc(12px + env(safe-area-inset-bottom, 0px));
+	border-top: 1px solid var(--line);
+	background: var(--bg);
+}
+.app-bottom .actions {
+	margin-top: 0;
+}
+.board-columns {
+	position: sticky;
+	top: 0;
+	z-index: 1;
+}
+main.app footer {
+	margin-top: auto;
+	padding: 8px var(--gutter) 0;
+}
+/* The result's scroll area already has side padding of its own. */
+.screen-result main.app footer,
+main.screen-result footer {
+	padding: 8px 0 0;
+}
 /* Type */
 h1 {
 	margin: 0;
@@ -148,107 +234,14 @@ label,
 	flex-direction: column;
 	gap: 8px;
 }
-.station-box {
-	height: 60px;
-	padding: 0 6px 0 16px;
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	background: var(--input-bg);
-	border-radius: var(--radius);
-}
-.station-box:focus-within {
-	outline: 2px solid var(--accent);
-	outline-offset: 2px;
-}
-.station-box input {
-	flex: 1 1 auto;
-	min-width: 0;
-	height: 100%;
-	padding: 0;
-	background: none;
-	border: 0;
-	outline: none;
-	color: var(--on-light);
-	font: 600 20px var(--font-body);
-}
 input::placeholder {
 	color: var(--placeholder);
 	opacity: 1;
-}
-.locate-btn {
-	flex: 0 0 auto;
-	width: 48px;
-	height: 48px;
-	display: flex;
-	align-items: center;
-	justify-content: center;
-	background: var(--input-bg-secondary);
-	border: 0;
-	border-radius: var(--radius-sm);
-	color: var(--on-light);
-}
-.locate-btn:hover:not(:disabled) {
-	background: #d6dcef;
-}
-.locate-btn.locating svg {
-	animation: pulse 1s ease-in-out infinite alternate;
-}
-@keyframes pulse {
-	to {
-		opacity: 0.3;
-	}
 }
 .locate-error {
 	margin: 0;
 	font-size: 14px;
 	color: var(--error);
-}
-
-/* Autocomplete: white like the field it drops from. */
-.ac {
-	position: absolute;
-	top: calc(100% + 4px);
-	left: 0;
-	right: 0;
-	z-index: 20;
-	max-height: 300px;
-	overflow-y: auto;
-	background: var(--input-bg);
-	border-radius: var(--radius);
-	box-shadow: 0 12px 32px rgba(4, 12, 40, 0.5);
-	color: var(--on-light);
-}
-.ac-item {
-	width: 100%;
-	min-height: 48px;
-	padding: 10px 16px;
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 10px;
-	background: transparent;
-	border: 0;
-	border-bottom: 1px solid var(--input-bg-secondary);
-	text-align: left;
-}
-.ac-item:last-child {
-	border-bottom: 0;
-}
-.ac-item:hover {
-	background: var(--input-bg-secondary);
-}
-.ac-name {
-	font-weight: 600;
-}
-.ac-meta {
-	font-size: 13px;
-	color: #4a5a8f;
-	white-space: nowrap;
-}
-.ac-item.recent .ac-meta {
-	font-weight: 600;
-	color: var(--on-light);
 }
 
 /* "Jetzt / Später" */
@@ -547,7 +540,31 @@ input::placeholder {
 	color: var(--text);
 }
 .pager:disabled {
-	opacity: 0.5;
+	/* Never dim: the spinner in the pager that is loading is the only feedback. */
+	opacity: 1;
+	color: var(--text-muted); /* iOS greys disabled buttons on its own */
+	-webkit-text-fill-color: currentColor;
+	cursor: default;
+}
+.spinner {
+	display: inline-block;
+	width: 20px;
+	height: 20px;
+	vertical-align: middle;
+	border: 2.5px solid var(--line);
+	border-top-color: var(--accent);
+	border-radius: 50%;
+	animation: spin 0.7s linear infinite;
+}
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	.spinner {
+		animation-duration: 1.6s;
+	}
 }
 
 /* Result */
@@ -747,5 +764,262 @@ footer {
 	}
 	.segmented button {
 		padding: 0 12px;
+	}
+}
+
+/* Native feel ------------------------------------------------------------ */
+.view {
+	flex: 1 1 auto;
+	min-height: 0;
+	display: flex;
+	flex-direction: column;
+	gap: inherit;
+}
+/* Controls aren't text: no selection, no iOS callout, no double-tap zoom. */
+button,
+a,
+.board-row,
+.segmented {
+	touch-action: manipulation;
+	-webkit-touch-callout: none;
+}
+main.app {
+	-webkit-user-select: none;
+	user-select: none;
+}
+button,
+.departure {
+	transition:
+		transform 0.12s ease,
+		background-color 0.12s ease,
+		opacity 0.12s ease;
+}
+button:active:not(:disabled) {
+	transform: scale(0.97);
+}
+.departure:active:not(:disabled) {
+	transform: none;
+	background: var(--row-selected);
+}
+.back:active:not(:disabled) {
+	transform: none;
+	opacity: 0.6;
+}
+.btn:active:not(:disabled),
+.chip:active:not(:disabled) {
+	opacity: 0.85;
+}
+/* Hover styles stick on touch screens; only apply them with a real pointer. */
+@media (hover: none) {
+	.departure:hover,
+	.btn-outline:hover:not(:disabled),
+	.chip:hover:not(:disabled) {
+		background: none;
+		border-color: var(--chip-border);
+	}
+	.departure.selected:hover {
+		background: var(--row-selected);
+	}
+}
+@media (prefers-reduced-motion: reduce) {
+	button,
+	.departure {
+		transition: none;
+	}
+	button:active:not(:disabled) {
+		transform: none;
+	}
+}
+
+/* Station picker (like the SBB app): a tappable field that opens a full-screen
+   search sheet with the current location, recents and results. */
+.station-field {
+	width: 100%;
+	min-height: 68px;
+	padding: 10px 16px;
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	text-align: left;
+	background: var(--input-bg);
+	color: var(--on-light);
+	border: 0;
+	border-radius: var(--radius);
+}
+.sf-icon {
+	flex: none;
+	color: var(--placeholder);
+}
+.sf-text {
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+}
+.sf-label {
+	font: 600 13px var(--font-display);
+	color: var(--placeholder);
+	letter-spacing: 0.02em;
+}
+.sf-value {
+	font: 600 20px/1.25 var(--font-body);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.sf-value.placeholder {
+	color: var(--placeholder);
+	font-weight: 500;
+}
+.sheet {
+	position: fixed;
+	inset: 0;
+	z-index: 50;
+	display: flex;
+	flex-direction: column;
+	background: var(--bg);
+	transform: translateY(100%);
+	transition: transform 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+	will-change: transform;
+}
+.sheet.open {
+	transform: none;
+}
+.sheet-bar {
+	flex: none;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: calc(10px + env(safe-area-inset-top, 0px)) calc(12px + env(safe-area-inset-right, 0px)) 10px
+		calc(6px + env(safe-area-inset-left, 0px));
+	border-bottom: 1px solid var(--line);
+}
+.sheet-back,
+.sheet-clear {
+	flex: none;
+	width: 44px;
+	height: 44px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	background: none;
+	border: 0;
+	color: var(--text);
+}
+.sheet-input {
+	flex: 1 1 auto;
+	min-width: 0;
+	height: 48px;
+	display: flex;
+	align-items: center;
+	background: var(--input-bg);
+	border-radius: 24px;
+	padding-left: 18px;
+}
+.sheet-clear {
+	width: 40px;
+	height: 40px;
+	margin-right: 4px;
+	color: var(--placeholder);
+}
+.sheet-input input {
+	flex: 1 1 auto;
+	min-width: 0;
+	height: 100%;
+	padding: 0;
+	background: none;
+	border: 0;
+	outline: none;
+	color: var(--on-light);
+	font: 500 18px var(--font-body);
+	-webkit-appearance: none;
+	appearance: none;
+}
+.sheet-input input::-webkit-search-cancel-button {
+	display: none;
+}
+input::placeholder {
+	color: var(--placeholder);
+	opacity: 1;
+}
+.sheet-list {
+	flex: 1 1 auto;
+	min-height: 0;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+}
+.sheet-heading {
+	margin: 0;
+	padding: 18px var(--gutter) 6px;
+	font: 700 13px var(--font-display);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+	color: var(--text-muted);
+}
+.sheet-row {
+	width: 100%;
+	min-height: 60px;
+	padding: 8px var(--gutter);
+	display: flex;
+	align-items: center;
+	gap: 14px;
+	text-align: left;
+	background: none;
+	border: 0;
+	border-bottom: 1px solid var(--line);
+	color: var(--text);
+}
+.sheet-row:active:not(:disabled) {
+	background: var(--row-selected);
+	transform: none;
+}
+.sr-icon {
+	flex: none;
+	width: 36px;
+	height: 36px;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	border-radius: 50%;
+	background: var(--surface);
+	color: var(--text-muted);
+}
+.sr-icon.accent {
+	background: var(--accent);
+	color: var(--on-light);
+}
+.sheet-row.locating .sr-icon svg {
+	animation: pulse 1s ease-in-out infinite alternate;
+}
+.sr-text {
+	min-width: 0;
+	display: flex;
+	flex-direction: column;
+}
+.sr-name {
+	font: 600 18px/1.25 var(--font-body);
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.sr-meta {
+	font-size: 13px;
+	color: var(--text-muted);
+}
+.sheet-empty,
+.sheet-list .locate-error {
+	margin: 0;
+	padding: 16px var(--gutter);
+}
+.sheet-empty {
+	color: var(--text-muted);
+}
+@media (prefers-reduced-motion: reduce) {
+	.sheet {
+		transition: none;
+	}
+}
+@keyframes pulse {
+	to {
+		opacity: 0.3;
 	}
 }
