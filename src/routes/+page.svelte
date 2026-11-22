@@ -1033,6 +1033,14 @@
 		{@render status()}
 		</div>
 
+		<div class="board-row board-columns" aria-hidden="true">
+			<span>Zeit</span>
+			<span>Nach</span>
+			<span class="platform-col">
+				{listResults.some((r) => TRACK_MODES.has(r.mode)) ? 'Gleis' : 'Kante'}
+			</span>
+		</div>
+
 		<!-- svelte-ignore a11y_no_static_element_interactions -->
 		<div
 			class="app-scroll"
@@ -1043,13 +1051,6 @@
 			ontouchcancel={() => (touching = false)}
 		>
 		<div class="board">
-			<div class="board-row board-columns" aria-hidden="true">
-				<span>Zeit</span>
-				<span>Nach</span>
-				<span class="platform-col">
-					{listResults.some((r) => TRACK_MODES.has(r.mode)) ? 'Gleis' : 'Kante'}
-				</span>
-			</div>
 			<button
 				class="pager"
 				type="button"

@@ -160,10 +160,9 @@ main.app {
 .app-bottom .actions {
 	margin-top: 0;
 }
+/* Outside the scroll area, so pulling the list down at the top never drags it along. */
 .board-columns {
-	position: sticky;
-	top: 0;
-	z-index: 1;
+	flex: none;
 }
 main.app footer {
 	margin-top: auto;
