@@ -1,0 +1,18 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: github.repository == 'jelleschutter/wie-spaet-ist-zu-spaet' && github.ref == 'refs/heads/main'
+    uses: jelleschutter/ansible-deploy/.github/workflows/deploy.yml@main
+    with:
+      limit: inf-ch-jel1
+      tags: wie-spaet-ist-zu-spaet-deploy
+    secrets: inherit
